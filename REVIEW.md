@@ -721,3 +721,73 @@ Each option has an "undo" recipe. The section also calls out the
 security tradeoff: disabling microcode loading removes Spectre / L1TF /
 MDS / Downfall / INCEPTION mitigations that depend on a recent
 microcode revision.
+
+---
+
+## Part G — "MOK storage full" troubleshooting
+
+User-reported issue. After removing `intel-microcode` and clearing MOK
+keys from BIOS, `mokutil --import` still hit "MOK storage full" at the
+blue MokManager screen on reboot. The two facts together are a strong
+hint that the real cause is EFI variable region exhaustion, not the
+MOK list itself.
+
+Section 10 of the recovery manual now covers this end to end:
+
+### G1. Step 1 — diagnose what is actually consuming NVRAM
+
+`sudo ls -laS /sys/firmware/efi/efivars/ | head -30` plus the optional
+`efivar -l` give a size-sorted view. Four common culprits called out:
+
+1. `dump-type0-*` entries from kernel panics (pstore writing to
+   efivars). Often the dominant consumer.
+2. Stale `Boot####` entries from old kernels / live USBs / Windows
+   installs.
+3. Wedged pending MOK requests (`MokNew`, `MokDel`, `MokAuth`) left
+   after a failed import.
+4. Genuinely many `MokListRT` entries from repeated enrolments.
+
+### G2. Step 2 — clear pstore crash dumps
+
+`rm -f /sys/fs/pstore/*` removes the dumps and the matching efivar
+entries. To prevent regrowth, drop a `modprobe.d/pstore.conf` snippet
+disabling efi_pstore, or pass `efi_pstore.pstore_disable=1` on the
+kernel command line. Crash dumps still go through kdump / journald,
+just not into NVRAM.
+
+### G3. Step 3 — prune stale UEFI boot entries
+
+`efibootmgr -v` to enumerate, `efibootmgr -B -b <hex>` to delete.
+Section warns explicitly against deleting the entry that loaded the
+running kernel (cross-reference with `BootCurrent`).
+
+### G4. Step 4 — cancel wedged pending MOK requests
+
+`mokutil --revoke-import` and `mokutil --revoke-delete`, plus
+`--list-new` / `--list-delete` to verify they came out clean.
+
+### G5. Step 5 — `mokutil --reset` to wipe and re-enrol
+
+Last Linux-side resort. Schedules a full MOK list reset, the user
+completes it from the MokManager screen, then re-enrols a single
+custom MOK with `mokutil --import`.
+
+### G6. Step 6 — BIOS-level resets (ASRock Z170 PG specifically)
+
+Ordered from least to most invasive:
+
+1. BIOS → Security → Secure Boot → Key Management → Restore Factory
+   Keys.
+2. BIOS → Exit → Load UEFI Defaults (also resets XMP, fan curves).
+3. CMOS clear via CLRCMOS1 jumper or coin-cell pull (with the standard
+   30 s hold-down of the power button to drain capacitors).
+4. BIOS re-flash with "Clear NVRAM" if the ASRock BIOS exposes it.
+
+### G7. Note: microcode removal does not free MOK / NVRAM space
+
+The section explicitly flags this so future readers do not chase the
+same red herring the user did: `intel-microcode` lives in `/boot`, not
+in EFI variables, so purging it cannot free a single byte of NVRAM.
+Section 8 (microcode) and section 10 (MOK / NVRAM) are independent
+issues that just happen to both show up on the same Z170 PG board
+because of its small BIOS flash and small NVRAM region.

@@ -43,9 +43,10 @@ sections delete files. Don't run them blind.
         <li><a href="#tty">7. Boot to terminal-only mode (TTY / GRUB / target 3)</a></li>
         <li><a href="#microcode">8. Disable the kernel microcode loader (limited-BIOS-ROM boards, e.g. ASRock Z170 PG)</a></li>
         <li><a href="#driver">9. Reinstall the NVIDIA driver (.run + MOK + Secure Boot)</a></li>
-        <li><a href="#cuda">10. Reinstall CUDA / cuDNN (optional)</a></li>
-        <li><a href="#gui">11. Fix a broken nvidia-settings GUI (optional)</a></li>
-        <li><a href="#final">12. Final cleanup and sanity check</a></li>
+        <li><a href="#mokfull">10. Troubleshooting: "MOK storage full" / EFI NVRAM exhausted</a></li>
+        <li><a href="#cuda">11. Reinstall CUDA / cuDNN (optional)</a></li>
+        <li><a href="#gui">12. Fix a broken nvidia-settings GUI (optional)</a></li>
+        <li><a href="#final">13. Final cleanup and sanity check</a></li>
     </ol>
 </div>
 
@@ -511,7 +512,202 @@ sudo mokutil --list-enrolled | grep -i 'Local NVIDIA'</pre>
     </div>
 </div>
 
-<h2 id="cuda">10. Reinstall CUDA / cuDNN (optional)</h2>
+<h2 id="mokfull">10. Troubleshooting: "MOK storage full" / EFI NVRAM exhausted</h2>
+<div class="step">
+    <p>Symptom: at the blue MokManager screen after
+    <code>mokutil --import</code>, the firmware prints
+    <strong>"MOK storage full"</strong> (or "failed to allocate variable")
+    and refuses to enrol the key. After reboot the kernel modules signed
+    with that MOK still fail to load.</p>
+
+    <p>What this actually means: <em>not</em> that you have too many MOKs.
+    It means the EFI variable region in firmware NVRAM is exhausted.
+    Mainboards have a fixed-size NVRAM area (often only ~64 KB on
+    Skylake-era ASRock boards) that is shared by:</p>
+    <ul>
+        <li>Secure Boot key databases (<code>db</code>, <code>dbx</code>,
+            <code>KEK</code>, <code>PK</code>);</li>
+        <li>MOK variables (<code>MokListRT</code>,
+            <code>MokListXRT</code>, <code>MokListTrustedRT</code>,
+            and the pending-request siblings <code>MokNew</code>,
+            <code>MokDel</code>, <code>MokAuth</code>);</li>
+        <li>UEFI boot entries (<code>Boot####</code>,
+            <code>BootOrder</code>, <code>BootCurrent</code>);</li>
+        <li>Linux pstore crash dumps written through the
+            <code>efivars</code> backend
+            (<code>dump-type0-*-#-#-#</code>); these accumulate every
+            time the kernel panics or you call <code>echo c &gt;
+            /proc/sysrq-trigger</code>;</li>
+        <li>Firmware-side data (HII forms, certificate revocation lists,
+            CSM compatibility tables on hybrid BIOSes, OEM logos,
+            anti-rollback counters, fTPM state on boards with
+            firmware-TPM, ASRock-specific "Instant Flash" / "Easy Driver
+            Installer" state).</li>
+    </ul>
+
+    <p>Clearing <em>just</em> the MOK keys from the BIOS does not
+    reclaim the space taken by everything else. You have to find what
+    is actually consuming the region.</p>
+
+    <div class="warning">
+        <strong>Read this whole section before touching anything in
+        <code>/sys/firmware/efi/efivars/</code>.</strong> A wrong
+        <code>rm</code> in that directory can brick the board
+        (historically, <code>rm -rf</code> on <code>efivars</code>
+        nuked some Samsung laptops). Recent kernels make the dangerous
+        variables immutable with <code>chattr +i</code>, but treat the
+        directory as live firmware state, not a filesystem.
+    </div>
+
+    <h3>Step 1 — see what is actually consuming NVRAM</h3>
+<pre># Top consumers of EFI variable storage, largest first:
+sudo ls -laS /sys/firmware/efi/efivars/ | head -30
+
+# Total in-use vs total available (kernel reports both via dmesg):
+sudo dmesg | grep -iE 'efivars|efi: |variable storage|nvram' | head
+
+# A nicer breakdown if you have the 'efivar' tool:
+sudo apt install -y efivar
+sudo efivar -l | wc -l
+sudo efivar -l | head -40</pre>
+    <p>The four things that most commonly explain a "full" NVRAM on a
+    long-lived Linux install are:</p>
+    <ol>
+        <li>dozens of <code>dump-type0-*</code> entries from kernel
+            panics (these can each be several KB);</li>
+        <li>dozens of stale <code>Boot####</code> entries from old
+            kernels / live USBs / Windows installs that were never
+            cleaned up;</li>
+        <li>a wedged pending MOK request (<code>MokNew</code>,
+            <code>MokDel</code>, <code>MokAuth</code>) left after a
+            failed previous import;</li>
+        <li>the actual <code>MokListRT</code> if you have legitimately
+            enrolled many keys over time.</li>
+    </ol>
+
+    <h3>Step 2 — clear Linux pstore crash dumps</h3>
+    <p>These are the most common culprit and the safest to remove.
+    <code>pstore</code> is the kernel's crash-dump backend; on UEFI
+    systems it routes through EFI variables by default. Each panic
+    leaves a 1–4 KB blob in NVRAM that nobody ever cleans up.</p>
+<pre># See what is there:
+sudo ls -lh /sys/fs/pstore/ 2>/dev/null
+
+# Delete them (this also removes the matching efivars entries):
+sudo rm -f /sys/fs/pstore/*
+
+# Stop them from coming back: log to disk instead of efivars.
+sudo tee /etc/modprobe.d/pstore.conf &gt;/dev/null &lt;&lt;'EOF'
+# Prefer a filesystem-backed pstore so crash dumps do not fill EFI NVRAM.
+options efi_pstore pstore_disable=1
+EOF
+sudo update-initramfs -u</pre>
+    <p>For a stronger fix on boards with chronically small NVRAM, add
+    <code>efi_pstore.pstore_disable=1</code> to
+    <code>GRUB_CMDLINE_LINUX_DEFAULT</code> in
+    <code>/etc/default/grub</code> and <code>sudo update-grub</code>.
+    Crashes still get logged via kdump / journald, just not into EFI
+    NVRAM.</p>
+
+    <h3>Step 3 — prune stale UEFI boot entries</h3>
+    <p>On a system that has gone through several reinstalls (Ubuntu
+    24.04, the prior 22.04, a Windows partition, a live USB, etc.),
+    <code>efibootmgr -v</code> will often show 10–20
+    <code>Boot####</code> entries pointing at filesystems that no longer
+    exist.</p>
+<pre># List current entries with their targets:
+sudo efibootmgr -v
+
+# Each entry is hex-numbered (Boot0000, Boot0001, ...).
+# Delete a specific one:
+sudo efibootmgr -B -b 0007        # delete entry Boot0007
+
+# Or, more conservatively, just deactivate it first:
+sudo efibootmgr -A -b 0007        # mark Boot0007 inactive</pre>
+    <p>Only delete entries you can clearly identify as stale (e.g.
+    "ubuntu (on /dev/disk/by-partuuid/&lt;gone&gt;)", "USB device
+    (vanished)"). <strong>Do not delete the live entry that loaded
+    your current kernel</strong> — cross-reference with
+    <code>cat /sys/firmware/efi/efivars/BootCurrent-*</code>.</p>
+
+    <h3>Step 4 — cancel a wedged pending MOK request</h3>
+    <p>If a previous <code>mokutil --import</code> or
+    <code>mokutil --delete</code> was started but never confirmed in
+    MokManager, the request sits in NVRAM consuming space and the next
+    import sees a "full" region.</p>
+<pre># See what is queued:
+sudo mokutil --list-new
+sudo mokutil --list-delete
+
+# Cancel any pending import:
+sudo mokutil --revoke-import
+
+# Cancel any pending delete:
+sudo mokutil --revoke-delete
+
+# Sanity check: should both print "MokNew is empty" / "MokDel is empty".
+sudo mokutil --list-new
+sudo mokutil --list-delete</pre>
+
+    <h3>Step 5 — last resort: wipe and reseed the entire MOK list</h3>
+    <p>If you have legitimately enrolled many MOKs and need to start
+    over with a single one (the typical case for a custom-built kernel
+    module signing setup):</p>
+<pre># Schedule a full MOK reset on next boot. Asks for a one-time password.
+sudo mokutil --reset
+
+# After reboot, in the blue MokManager screen:
+#   - choose "Reset MOK" -&gt; "Continue"
+#   - enter the password
+#   - reboot
+# All currently enrolled MOKs are removed. Re-enrol your one custom MOK with:
+sudo mokutil --import /root/module-signing/MOK.der</pre>
+
+    <h3>Step 6 — BIOS-level last resort (ASRock Z170 PG and friends)</h3>
+    <p>If steps 2–5 still leave NVRAM full, the firmware itself is
+    holding state that Linux cannot reach. Order of operations:</p>
+    <ol>
+        <li><strong>BIOS Setup → Security → Secure Boot → Key
+            Management → Restore Factory Keys</strong> (or "Reset to
+            Setup Mode" then "Install default keys"). This is the
+            "right" reset path on ASRock 100/200-series boards.</li>
+        <li><strong>BIOS Setup → Exit → Load UEFI Defaults</strong>
+            — the catch-all factory-reset on ASRock. Save and exit.
+            <em>This resets everything else too</em>, including XMP
+            memory profiles and fan curves — expect to redo those.</li>
+        <li><strong>Clear CMOS via jumper or coin-cell pull.</strong>
+            For the Z170 PG: power off, unplug, hold the front-panel
+            power button for ~30 s to drain capacitors, move the CLRCMOS1
+            jumper or pull the coin-cell battery for 5–10 minutes,
+            replace, power on. This wipes everything in NVRAM that
+            survives a normal defaults-restore (anti-rollback counters,
+            stuck Secure Boot vendor entries, fTPM state).</li>
+        <li><strong>BIOS update / re-flash.</strong> ASRock's Instant
+            Flash, applied with the "Clear NVRAM" option (if your BIOS
+            version exposes it), forces a full NVRAM re-init. Use the
+            <em>same</em> BIOS version you are already on; you only want
+            the NVRAM reset, not a firmware change.</li>
+    </ol>
+
+    <div class="note">
+        After any of step 6, Secure Boot is back in Setup Mode (no MOK
+        list, no <code>db</code> entries beyond the firmware defaults).
+        Re-enrol your custom MOK with <code>mokutil --import</code> and
+        complete the MokManager flow exactly once. Resist the urge to
+        re-enrol "just in case" — every duplicate enrolment consumes
+        more of the limited NVRAM.
+    </div>
+
+    <div class="warning">
+        Removing <code>intel-microcode</code> (section 8) does NOT free
+        any MOK / NVRAM space. Microcode lives in <code>/boot</code> on
+        the filesystem, not in EFI variables. If you tried that as a
+        workaround for "MOK storage full," it was a coincidence, not a
+        fix — the two issues are unrelated.
+    </div>
+</div>
+
+<h2 id="cuda">11. Reinstall CUDA / cuDNN (optional)</h2>
 <div class="step">
     <p>Only after the purge in step 6 has succeeded. Install the CUDA toolkit
     version you actually want from
@@ -563,7 +759,7 @@ sudo apt install -y cudnn</pre>
     </div>
 </div>
 
-<h2 id="gui">11. Fix a broken <code>nvidia-settings</code> GUI (optional)</h2>
+<h2 id="gui">12. Fix a broken <code>nvidia-settings</code> GUI (optional)</h2>
 <div class="step">
     <p>Some Ubuntu releases shipped an <code>nvidia-settings</code> package
     (the 510 / 590 series) that crashes with
@@ -592,7 +788,7 @@ sudo ./fix_nvidia_gui_v2.sh revert    # restore the apt-shipped files</pre>
     </div>
 </div>
 
-<h2 id="final">12. Final cleanup and sanity check</h2>
+<h2 id="final">13. Final cleanup and sanity check</h2>
 <div class="step">
 <pre>sudo apt update
 sudo apt full-upgrade -y
