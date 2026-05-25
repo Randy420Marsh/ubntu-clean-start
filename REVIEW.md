@@ -9,6 +9,10 @@ The corrected versions are:
 - `safe_clean_nvidia.sh` — replacement for the bash purge script.
 - `recovery_manual.html` — replacement for the HTML recovery manual,
   with the safe-purge script integrated as section 6.
+- `driver-install.sh` — replacement for the NVIDIA .run installer wrapper
+  that signs the kernel module with a Machine Owner Key.
+- `fix_nvidia_gui_v2.sh` — replacement for the script that works around the
+  Ubuntu `nvidia-settings` "double free" crash.
 
 ---
 
@@ -385,3 +389,275 @@ Fixed: the new section 8 ends with `sudo ldconfig` before the reboot.
 | B10 | `~/.bashrc` non-idempotent appends | Idempotent `/etc/profile.d/cuda.sh` |
 | B11 | Cleanup mixed into reinstall section | Centralised in purge section (script) |
 | B12 | No final `ldconfig` | Added |
+
+---
+
+## Part C — `driver-install.sh` (original)
+
+### C1. Hard-coded driver filename and version
+
+The original hard-codes `NVIDIA-Linux-x86_64-595.71.05.run` as both the
+filename and the implicit version. Anyone with a different driver release
+has to edit the script. Worse, there is no check that the file exists
+before `sudo` is invoked — if it is missing, `sudo` prompts for a
+password, then the run silently `command not found`s.
+
+Fix: the new script either accepts the .run path as an argument or
+auto-detects `./NVIDIA-Linux-*.run`. It refuses to continue if there is no
+match, or if there are multiple matches and the user did not disambiguate.
+
+### C2. No verification of MOK key / certificate before running
+
+The original passes `--module-signing-secret-key=/root/module-signing/MOK.key`
+straight to the installer without checking whether that file exists. If
+it does not, the NVIDIA installer aborts halfway through, leaving the
+system with a partially-installed driver (the userland is replaced; the
+kernel module never finishes building).
+
+Fix: the new script verifies that both the key and the certificate exist
+before invoking the installer. If they do not, it offers to generate a
+fresh keypair with `openssl req`, written to `/root/module-signing/` with
+the correct permissions.
+
+### C3. No MOK enrolment guidance — signed-but-not-trusted modules
+
+This is the biggest functional gap in the original. Signing a kernel
+module with a key that is not enrolled in shim's MOK list produces a
+module the kernel refuses to load under Secure Boot. The driver appears
+to install fine, then `nvidia-smi` fails with `NVIDIA-SMI has failed
+because it couldn't communicate with the NVIDIA driver` and `dmesg`
+shows `Loading of unsigned module is rejected` or `module verification
+failed`. The original script never mentions `mokutil --import`, never
+checks whether the MOK is already enrolled, and never explains the blue
+MokManager screen that appears on the next reboot.
+
+Fix: the new script:
+- detects Secure Boot state with `mokutil --sb-state`;
+- if SB is enabled, runs `mokutil --test-key` to see if the MOK is
+  already enrolled;
+- if it is not, prints a clear walk-through and offers to run
+  `mokutil --import` for the user (which schedules enrolment for the
+  next reboot);
+- exits cleanly after scheduling enrolment, telling the user to reboot,
+  complete enrolment in MokManager, then rerun the script.
+
+### C4. `--kernel-module-type=open` is used unconditionally
+
+The open kernel modules only support Turing (RTX 20-series, GTX 16-series)
+and newer. On Pascal (10-series), Maxwell (9-series), or Kepler hardware
+the installer prints a confusing error and exits. The original always
+passes `--kernel-module-type=open`.
+
+Fix: the new script reads `lspci`, matches the GPU name against the known
+set of architectures that support open modules, and picks the right
+module type automatically. The user can override with
+`--open` or `--proprietary`.
+
+### C5. Inconsistent sudo / root handling
+
+The original is meant to be run as a regular user (it uses `sudo` inside),
+but several of its commands (`sudo ./NVIDIA...run`, `sudo apt update`,
+`sudo chmod ...`) prompt for sudo on every other line, which breaks
+non-interactive use. There is also no `EUID` check; if the user happens
+to invoke it with `sudo`, the inner `sudo` calls become redundant.
+
+Fix: the new script requires EUID 0 and drops every inner `sudo`. One
+authentication point at the entry, not five.
+
+### C6. `read -p` under `set -e` is a foot-gun, and not TTY-safe
+
+The original script enables `set -e` then calls `read -p "Press Enter..."`
+at two places. If the script is piped (e.g. `curl ... | sudo bash`)
+`read` returns failure on the closed stdin, which `set -e` interprets as
+a fatal error and exits before the install ever runs. Even on a TTY,
+running the script via `sh -c '... | tee log.txt'` produces the same
+symptom.
+
+Fix: the new script does not use `set -e`. Its `pause()` and `ask_yn()`
+helpers explicitly read from `/dev/tty` when stdin is not a terminal, and
+fall through cleanly when no TTY is available at all.
+
+### C7. Display server is not actually stopped
+
+The original tells the user to run
+`sudo systemctl isolate multi-user.target` in another terminal and then
+waits for them to press Enter. That works in theory; in practice, the
+user does not always know what "runlevel 3" / "multi-user target" means,
+or how to get back. Worse, the script offers no help if the user is in
+that exact situation already (over SSH, on a headless box) and there is
+nothing to isolate.
+
+Fix: the new script:
+- detects whether `graphical.target` is currently active;
+- if it is, prints a short explanation of the three ways to drop to a
+  TTY — one-shot via GRUB, permanent via
+  `systemctl set-default multi-user.target`, or right-now via
+  `systemctl isolate multi-user.target`;
+- offers to do the `systemctl isolate` for them;
+- after install, if it is sitting in `multi-user.target`, prints how to
+  get the desktop back.
+
+The matching long-form walk-through lives in section 7 of
+`recovery_manual.html`.
+
+### C8. `apt --reinstall install nvidia-settings` conflicts with v2
+
+Step 4 of the original runs
+`sudo apt --reinstall install nvidia-settings`. On systems where the
+broken-`nvidia-settings` workaround in `fix_nvidia_gui_v2.sh` has already
+been applied, this command silently undoes the workaround — apt restores
+the crashing 510/590 binary on top of our diversion.
+
+Fix: the new script no longer reinstalls `nvidia-settings` by default.
+It prints a small section at the end explaining that the .run installer
+already dropped a working binary, and that the user should only run
+`apt-get install --reinstall nvidia-settings` if they prefer the apt
+version. There is also an explicit link to `fix_nvidia_gui_v2.sh` for
+systems where the apt version is the broken one.
+
+### C9. `apt --reinstall install` is plain `apt` and missing `-y`
+
+Plain `apt` is documented as not stable-for-scripts and will print
+`WARNING: apt does not have a stable CLI interface` on every run. It is
+also missing `-y`, so the script will block on a confirmation prompt.
+
+Fix: the new script uses `apt-get install --reinstall -y nvidia-settings`
+(only in the documented optional follow-up).
+
+### C10. No log file, no `nvidia-installer.log` hint on failure
+
+If the .run installer fails, the original `error` function only prints
+"NVIDIA .run installer failed." and exits. The actual cause is in
+`/var/log/nvidia-installer.log`, which the user has to know about.
+
+Fix: the new script prints the path of the installer log on any failure.
+
+### C11. Polkit fix is correct but trivially incomplete
+
+The `screen-resolution-extra` polkit wrapper at
+`/usr/share/screen-resolution-extra/nvidia-polkit` needs to be
+executable for the GUI to save configuration without sudo. The original
+gets this right. The new script preserves the fix; no change.
+
+---
+
+## Part D — `fix_nvidia_gui_v2.sh` (original)
+
+### D1. Silently overwrites apt-managed files
+
+The original `cp $EXTRACT_DIR/nvidia-settings /usr/bin/nvidia-settings`
+clobbers a file that is owned by the `nvidia-settings` package. Any
+future `apt install --reinstall nvidia-settings`,
+`apt-get install -f`, or even an unattended-upgrades run can restore the
+broken Ubuntu file over our fix without warning.
+
+Fix: the new script uses `dpkg-divert --add --rename --divert
+/usr/bin/nvidia-settings.distrib /usr/bin/nvidia-settings`, which moves
+the apt-shipped binary aside and registers the diversion in the dpkg
+database. apt is now structurally unable to overwrite our copy without
+first removing the diversion.
+
+### D2. Pin priority -1 is the wrong tool
+
+The original creates
+`/etc/apt/preferences.d/pin-nvidia-settings` with
+`Pin-Priority: -1`. That syntax bars the package from any apt source,
+but the package is already installed — pinning does not remove it, and
+does not stop `apt-mark auto` reasoning from removing the binary as a
+side-effect of an unrelated upgrade. It also produces confusing
+`apt policy` output that surprises people who later try to install a
+different NVIDIA package.
+
+Fix: the new script uses `apt-mark hold nvidia-settings` instead. That
+is the documented "do not upgrade or remove this package" mechanism,
+and it composes correctly with the dpkg-divert approach.
+
+### D3. Hard-coded `${base}.590.44.01` compatibility symlink
+
+The original creates a symlink named
+`libnvidia-gtk2.so.590.44.01` for one specific broken Ubuntu version.
+On any other Ubuntu host, that symlink is dead weight pointing at a
+version of the library that the system does not need; on the exact
+broken Ubuntu, it is required.
+
+Fix: the new script does not create this symlink unconditionally. It
+builds the unversioned (`libnvidia-gtkN.so`) symlink only, and the
+comment block documents how to add a version-specific compat link if a
+specific binary on the system actually needs it.
+
+### D4. `do_revert` does not actually revert the library overwrite
+
+The original `revert` removes only the apt pin file and runs
+`apt --reinstall install nvidia-settings`. The custom `.so` files we
+copied into `/usr/lib/x86_64-linux-gnu/` remain. The symlinks we created
+remain. ldconfig is never refreshed. After "revert", the system is
+still running our libraries.
+
+Fix: the new script tracks every file it touches in
+`/var/lib/fix_nvidia_gui_v2.state` and walks them in `revert`. The
+dpkg-divert mechanism makes this trivial: `dpkg-divert --remove --rename`
+on each target restores the distribution file in one atomic step. After
+that, the script runs `apt-mark unhold`, refreshes ldconfig, and
+reinstalls the apt package to make sure every file is back to its
+package-shipped state.
+
+### D5. No `set` discipline, no extract-failure check
+
+The original has no shell options set and does not check whether
+`--extract-only` succeeded. If the .run file is missing or corrupt the
+script continues with an empty `$EXTRACT_DIR` and produces a stream of
+`cp: cannot stat` errors before completing "successfully."
+
+Fix: the new script uses `set -uo pipefail`, gates every step with
+explicit `[ -f ... ] || die`, and traps EXIT to clean up the temporary
+extract directory whether the run succeeded or failed.
+
+### D6. No status / diagnostics subcommand
+
+The original has `install` / `revert` only. Anyone trying to debug "did
+I run this script on this box?" has to grep for the pin file by hand.
+
+Fix: the new script adds a `status` subcommand that lists which paths
+are currently diverted, whether `nvidia-settings` is held, and what is
+in the state file.
+
+### D7. Version detection regex is fine but fragile
+
+`grep -oP '\d+\.\d+\.\d+'` matches the first three-dot-version in the
+filename. It works on `NVIDIA-Linux-x86_64-595.71.05.run`, but on a
+filename like `NVIDIA-12-Linux-x86_64-595.71.05.run` it would pick the
+wrong group.
+
+Fix: the new script anchors on `basename` and uses an `[0-9]+` ERE; minor
+robustness improvement, not a security issue.
+
+---
+
+## Part E — additions to `recovery_manual.html` requested mid-review
+
+### E1. Boot to terminal-only mode (TTY / GRUB / runlevel 3)
+
+The manual previously had no section explaining how to boot to a TTY,
+which is a prerequisite for installing the NVIDIA driver from a .run
+file. Section 7 of the new manual covers all four practical paths:
+
+1. One-shot edit at the GRUB menu (append `3` or
+   `systemd.unit=multi-user.target` to the `linux ...` line, press
+   Ctrl-X).
+2. Permanent default = TTY via `sudo systemctl set-default
+   multi-user.target`.
+3. Permanent via `GRUB_CMDLINE_LINUX_DEFAULT` in `/etc/default/grub`,
+   followed by `update-grub`.
+4. Right-now via `sudo systemctl isolate multi-user.target`, with a
+   matching `isolate graphical.target` to come back.
+
+Each option lists how to undo it, plus the warning that option 4 will
+kill the current graphical session immediately (so save your work).
+
+### E2. Sections 8 and 10 documenting the new scripts
+
+The manual now has dedicated sections describing `driver-install.sh`
+and `fix_nvidia_gui_v2.sh`, with the same caveats called out in the
+scripts themselves (Secure Boot / MOK enrolment, GPU generation check,
+the conflict between `apt --reinstall nvidia-settings` and the v2
+diversion).
