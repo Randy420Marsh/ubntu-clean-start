@@ -186,6 +186,15 @@ ensure_mok_enrolled() {
     warn "MokManager BEFORE rerunning this script to install the driver."
     exit 0
   fi
+
+  # The user declined (or there was no TTY). Continuing into the installer
+  # would build modules signed with a key the kernel does not trust; modprobe
+  # would silently reject them under Secure Boot and nvidia-smi would fail.
+  # Bail loudly instead of producing a half-installed driver.
+  die "MOK is not enrolled and you declined enrolment. Refusing to install — \
+the kernel would reject the signed modules under Secure Boot. Enrol first with:
+    sudo mokutil --import $MOK_CRT
+then reboot, complete enrolment in MokManager, and rerun this script."
 }
 
 ensure_mok_keys
@@ -352,8 +361,14 @@ fi
 
 log "All steps completed."
 
-if [ "$SKIP_ISOLATE" -eq 0 ] && systemctl get-default 2>/dev/null \
-     | grep -q 'multi-user'; then
+# Check whether the *running* default target is multi-user. `systemctl
+# get-default` reads the persistent default symlink, which does NOT change
+# when we did `systemctl isolate multi-user.target`. `is-active
+# graphical.target` reflects the actual runtime state — if it is not active
+# right now, we are sitting in a TTY and the user needs to know how to get
+# the desktop back.
+if [ "$SKIP_ISOLATE" -eq 0 ] \
+   && ! systemctl is-active graphical.target >/dev/null 2>&1; then
   cat <<'EOF'
 
 You are currently in multi-user (TTY) mode. To get the desktop back:

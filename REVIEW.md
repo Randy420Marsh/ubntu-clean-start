@@ -661,3 +661,63 @@ and `fix_nvidia_gui_v2.sh`, with the same caveats called out in the
 scripts themselves (Secure Boot / MOK enrolment, GPU generation check,
 the conflict between `apt --reinstall nvidia-settings` and the v2
 diversion).
+
+---
+
+## Part F — post-merge bugfixes from Devin Review on PR #2
+
+These are bugs in the version of `driver-install.sh` that landed in
+`main` via PR #2 and were caught by Devin Review afterwards. They are
+fixed in the follow-up PR.
+
+### F1. `ensure_mok_enrolled` fell through when the user declined enrolment
+
+Original behaviour (post-merge): if Secure Boot was on and the MOK was
+not yet enrolled, `ensure_mok_enrolled()` would offer to run
+`mokutil --import` and, on a "yes" answer, schedule enrolment and exit
+cleanly. But if the user answered "no" — or if there was no TTY at all,
+in which case `ask_yn` returned the default "n" — the function silently
+returned and the script continued straight into the NVIDIA installer.
+The installer then signed the modules with a key the kernel does not
+trust, the install completed "successfully," and on the next reboot
+`modprobe nvidia` was rejected with a `module verification failed`
+message in `dmesg`. The user ended up with a half-installed driver and
+no `nvidia-smi`.
+
+Fix: after the "would you like to enrol now?" prompt, if the user did
+not accept (or there is no TTY), `die` loudly with the exact
+`sudo mokutil --import …` command needed. The script never reaches the
+installer with an un-enrolled MOK.
+
+### F2. `systemctl get-default` checked the wrong target
+
+Original behaviour: at the end of the script we printed a "you are now
+in TTY mode, here is how to get the desktop back" reminder, guarded by
+`systemctl get-default | grep -q multi-user`. The problem is that
+`get-default` reads `/etc/systemd/system/default.target`, which is the
+**persistent** default target. If the script switched the running
+session to `multi-user.target` via `systemctl isolate`, the persistent
+default symlink was unchanged (`graphical.target`), so the reminder was
+suppressed exactly when the user needed it the most.
+
+Fix: gate the reminder on `! systemctl is-active graphical.target` —
+that reflects the *currently running* state, not the boot-time default.
+A comment block in the script explains the distinction.
+
+### F3. Limited-BIOS-ROM motherboards (ASRock Z170 PG)
+
+User-reported issue, not a Devin Review finding. Section 8 of the
+recovery manual now covers disabling the kernel microcode loader on
+boards whose BIOS chip is too small to hold a current Intel microcode
+revision (the canonical Z170 case). Three documented paths:
+
+1. Kernel command line `dis_ucode_ldr` via
+   `/etc/default/grub` + `update-grub`.
+2. `apt purge intel-microcode iucode-tool` + `update-initramfs -u`.
+3. Pin a known-good `intel-microcode` version via
+   `apt install intel-microcode=<v>` + `apt-mark hold`.
+
+Each option has an "undo" recipe. The section also calls out the
+security tradeoff: disabling microcode loading removes Spectre / L1TF /
+MDS / Downfall / INCEPTION mitigations that depend on a recent
+microcode revision.

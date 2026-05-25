@@ -41,10 +41,11 @@ sections delete files. Don't run them blind.
         <li><a href="#gnome">5. Fix the GNOME desktop (double panel, extensions)</a></li>
         <li><a href="#nvidia">6. Purge old NVIDIA / CUDA / cuDNN safely</a></li>
         <li><a href="#tty">7. Boot to terminal-only mode (TTY / GRUB / target 3)</a></li>
-        <li><a href="#driver">8. Reinstall the NVIDIA driver (.run + MOK + Secure Boot)</a></li>
-        <li><a href="#cuda">9. Reinstall CUDA / cuDNN (optional)</a></li>
-        <li><a href="#gui">10. Fix a broken nvidia-settings GUI (optional)</a></li>
-        <li><a href="#final">11. Final cleanup and sanity check</a></li>
+        <li><a href="#microcode">8. Disable the kernel microcode loader (limited-BIOS-ROM boards, e.g. ASRock Z170 PG)</a></li>
+        <li><a href="#driver">9. Reinstall the NVIDIA driver (.run + MOK + Secure Boot)</a></li>
+        <li><a href="#cuda">10. Reinstall CUDA / cuDNN (optional)</a></li>
+        <li><a href="#gui">11. Fix a broken nvidia-settings GUI (optional)</a></li>
+        <li><a href="#final">12. Final cleanup and sanity check</a></li>
     </ol>
 </div>
 
@@ -290,7 +291,7 @@ dconf reset -f /org/gnome/shell/extensions/</pre>
 <h2 id="tty">7. Boot to terminal-only mode (TTY / GRUB / target 3)</h2>
 <div class="step">
     <p>Several of the steps below — most importantly installing the NVIDIA
-    driver in <a href="#driver">section 8</a> — need the display server to
+    driver in <a href="#driver">section 9</a> — need the display server to
     be stopped. "Boot to terminal" is the modern equivalent of old SysV
     <strong>runlevel 3</strong>; under systemd it is
     <code>multi-user.target</code>. Three ways to get there, pick whichever
@@ -358,7 +359,110 @@ sudo systemctl isolate graphical.target      # brings the desktop back</pre>
     </div>
 </div>
 
-<h2 id="driver">8. Reinstall the NVIDIA driver (.run + MOK + Secure Boot)</h2>
+<h2 id="microcode">8. Disable the kernel microcode loader (limited-BIOS-ROM boards, e.g. ASRock Z170 PG)</h2>
+<div class="step">
+    <p>Some older LGA1151 / Skylake-era motherboards — the
+    <strong>ASRock Z170 PG</strong> and other Z170 boards in particular —
+    ship with a BIOS flash chip too small to hold the full set of Intel
+    microcode revisions plus the rest of the firmware. The vendor's BIOS
+    has either an old microcode or no microcode at all, and Linux is
+    expected to apply a current revision early at boot from an initrd
+    blob.</p>
+
+    <p>On those boards, the in-kernel microcode loader can do one of three
+    annoying things:</p>
+    <ul>
+        <li>hang the box during early boot (you see the EFI stub messages,
+            then a black screen forever);</li>
+        <li>boot but with unstable CPU behaviour — random freezes,
+            <code>MCE</code> events in <code>dmesg</code>, USB / SATA
+            controller drops;</li>
+        <li>force a Spectre / L1TF / MDS mitigation set that the user
+            wants to opt out of for performance reasons.</li>
+    </ul>
+
+    <p>The fix is to stop Linux from loading microcode at boot and let the
+    BIOS-shipped revision stay in effect. Three ways to do it, pick one.</p>
+
+    <div class="warning">
+        <strong>Security tradeoff.</strong> Microcode updates carry fixes
+        for Spectre, Meltdown, L1TF, MDS, Downfall, INCEPTION, etc. If you
+        disable the kernel microcode loader and your BIOS does not ship a
+        recent microcode, you lose those mitigations. Only do this if you
+        have actually verified that the kernel microcode loader is the
+        cause of the problem you are seeing (e.g. with
+        <code>git bisect</code>-style testing of the
+        <code>intel-microcode</code> package versions). On a network-facing
+        machine, prefer fixing the BIOS instead.
+    </div>
+
+    <h3>Option A — kernel command line, <code>dis_ucode_ldr</code></h3>
+    <p>This is the per-boot kernel switch. Edit
+    <code>/etc/default/grub</code> and append
+    <code>dis_ucode_ldr</code> to
+    <code>GRUB_CMDLINE_LINUX_DEFAULT</code>:</p>
+<pre>sudo sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"$/GRUB_CMDLINE_LINUX_DEFAULT="\1 dis_ucode_ldr"/' /etc/default/grub
+sudo update-grub
+sudo reboot</pre>
+    <p>Verify after reboot:</p>
+<pre># Should print: "dis_ucode_ldr ..."
+cat /proc/cmdline | tr ' ' '\n' | grep ucode
+
+# Should print something like:
+#   microcode: Microcode loader disabled by kernel cmdline
+dmesg | grep -iE 'microcode|ucode' | head
+</pre>
+    <p>To undo: remove the token from <code>GRUB_CMDLINE_LINUX_DEFAULT</code>
+    and <code>sudo update-grub</code>.</p>
+
+    <h3>Option B — remove the <code>intel-microcode</code> package</h3>
+    <p>This stops the package from ever building an early-initrd microcode
+    blob in the first place. Useful when Option A is not enough because
+    a service (e.g. <code>iucode-tool</code>) is re-applying microcode
+    later in boot.</p>
+<pre>sudo apt purge intel-microcode iucode-tool
+sudo update-initramfs -u
+sudo reboot</pre>
+    <p>To undo: <code>sudo apt install intel-microcode</code> and reboot.</p>
+
+    <h3>Option C — pin a known-good microcode version</h3>
+    <p>If a specific recent <code>intel-microcode</code> revision is the
+    problem but you do still want microcode (the common Z170 case is that
+    one specific upload broke things; the previous one was fine), pin and
+    hold the older version:</p>
+<pre>apt list --all-versions intel-microcode
+sudo apt install intel-microcode=&lt;older-version&gt;
+sudo apt-mark hold intel-microcode
+sudo update-initramfs -u
+sudo reboot</pre>
+    <p>To undo: <code>sudo apt-mark unhold intel-microcode &amp;&amp; sudo apt
+    install intel-microcode</code>.</p>
+
+    <h3>Verifying the running revision</h3>
+<pre># What microcode revision the running CPU has loaded:
+grep -m1 microcode /proc/cpuinfo
+# Decoded:
+sudo dmidecode -t processor | grep -i 'version\|signature'
+# What Linux tried to apply (if anything):
+dmesg | grep -iE 'microcode|ucode'</pre>
+
+    <div class="note">
+        On ASRock Z170 PG specifically: the last BIOS that fits cleanly is
+        7.40 (LGA1151-v1 line). The <code>intel-microcode</code> package
+        revisions that have been reported to cause boot hangs on this
+        board cluster around the "Plundervolt" / "CrossTalk" Skylake
+        rollouts (3.20191112.1 and later). If you have to keep microcode
+        for security reasons, pinning <code>3.20191115.2ubuntu0.20.04.1</code>
+        or an earlier stable build (Option C) is usually the smallest
+        regression. Always check
+        <a href="https://github.com/intel/Intel-Linux-Processor-Microcode-Data-Files/releases">Intel's
+        public microcode-data-files repo</a> for any vendor notices
+        affecting your specific stepping (<code>cat /proc/cpuinfo | grep
+        -m1 -E 'model|stepping'</code>).
+    </div>
+</div>
+
+<h2 id="driver">9. Reinstall the NVIDIA driver (.run + MOK + Secure Boot)</h2>
 <div class="step">
     <p>This repository ships
     <a href="driver-install.sh"><code>driver-install.sh</code></a>, which
@@ -407,7 +511,7 @@ sudo mokutil --list-enrolled | grep -i 'Local NVIDIA'</pre>
     </div>
 </div>
 
-<h2 id="cuda">9. Reinstall CUDA / cuDNN (optional)</h2>
+<h2 id="cuda">10. Reinstall CUDA / cuDNN (optional)</h2>
 <div class="step">
     <p>Only after the purge in step 6 has succeeded. Install the CUDA toolkit
     version you actually want from
@@ -459,7 +563,7 @@ sudo apt install -y cudnn</pre>
     </div>
 </div>
 
-<h2 id="gui">10. Fix a broken <code>nvidia-settings</code> GUI (optional)</h2>
+<h2 id="gui">11. Fix a broken <code>nvidia-settings</code> GUI (optional)</h2>
 <div class="step">
     <p>Some Ubuntu releases shipped an <code>nvidia-settings</code> package
     (the 510 / 590 series) that crashes with
@@ -488,7 +592,7 @@ sudo ./fix_nvidia_gui_v2.sh revert    # restore the apt-shipped files</pre>
     </div>
 </div>
 
-<h2 id="final">11. Final cleanup and sanity check</h2>
+<h2 id="final">12. Final cleanup and sanity check</h2>
 <div class="step">
 <pre>sudo apt update
 sudo apt full-upgrade -y
