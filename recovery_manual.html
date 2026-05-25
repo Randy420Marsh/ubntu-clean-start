@@ -40,8 +40,11 @@ sections delete files. Don't run them blind.
         <li><a href="#reboot">4. Leave the chroot, unmount, reboot, verify</a></li>
         <li><a href="#gnome">5. Fix the GNOME desktop (double panel, extensions)</a></li>
         <li><a href="#nvidia">6. Purge old NVIDIA / CUDA / cuDNN safely</a></li>
-        <li><a href="#cuda">7. Reinstall CUDA / cuDNN (optional)</a></li>
-        <li><a href="#final">8. Final cleanup and sanity check</a></li>
+        <li><a href="#tty">7. Boot to terminal-only mode (TTY / GRUB / target 3)</a></li>
+        <li><a href="#driver">8. Reinstall the NVIDIA driver (.run + MOK + Secure Boot)</a></li>
+        <li><a href="#cuda">9. Reinstall CUDA / cuDNN (optional)</a></li>
+        <li><a href="#gui">10. Fix a broken nvidia-settings GUI (optional)</a></li>
+        <li><a href="#final">11. Final cleanup and sanity check</a></li>
     </ol>
 </div>
 
@@ -284,7 +287,127 @@ dconf reset -f /org/gnome/shell/extensions/</pre>
     </div>
 </div>
 
-<h2 id="cuda">7. Reinstall CUDA / cuDNN (optional)</h2>
+<h2 id="tty">7. Boot to terminal-only mode (TTY / GRUB / target 3)</h2>
+<div class="step">
+    <p>Several of the steps below — most importantly installing the NVIDIA
+    driver in <a href="#driver">section 8</a> — need the display server to
+    be stopped. "Boot to terminal" is the modern equivalent of old SysV
+    <strong>runlevel 3</strong>; under systemd it is
+    <code>multi-user.target</code>. Three ways to get there, pick whichever
+    fits the situation:</p>
+
+    <h3>Option A — One-shot, edit the entry at the GRUB menu</h3>
+    <ol>
+        <li>Reboot. If you don't see the GRUB menu, hold <strong>Shift</strong>
+            (BIOS boot) or tap <strong>Esc</strong> (UEFI boot) during
+            firmware POST.</li>
+        <li>Highlight the Ubuntu entry, press <strong>e</strong> to edit it.</li>
+        <li>Find the line that starts with <code>linux</code> (it ends with
+            something like <code>ro quiet splash $vt_handoff</code>).</li>
+        <li>Append a single <code>3</code> at the end of that line:
+<pre>linux /boot/vmlinuz-... ro quiet splash $vt_handoff 3</pre>
+            That tells systemd to start in <code>multi-user.target</code>.
+            If <code>3</code> is ignored on your distro for any reason,
+            use the explicit form instead:
+<pre>linux /boot/vmlinuz-... ro quiet splash $vt_handoff systemd.unit=multi-user.target</pre>
+        </li>
+        <li>Press <strong>Ctrl-X</strong> (or <strong>F10</strong>) to boot.
+            This boot only comes up in a TTY. The next normal boot will go
+            back to your usual default target.</li>
+    </ol>
+
+    <h3>Option B — Permanent: make the TTY the default target</h3>
+<pre>sudo systemctl set-default multi-user.target
+sudo reboot</pre>
+    <p>To go back to a graphical login screen:</p>
+<pre>sudo systemctl set-default graphical.target
+sudo reboot</pre>
+    <p>You can check what is set right now with:</p>
+<pre>systemctl get-default</pre>
+
+    <h3>Option C — Permanent via <code>/etc/default/grub</code></h3>
+    <p>Useful if you want the kernel command line to be persistent (for
+    example, also passing <code>nvidia-drm.modeset=1</code> at the same
+    time). Edit <code>/etc/default/grub</code> and find
+    <code>GRUB_CMDLINE_LINUX_DEFAULT</code>:</p>
+<pre>sudo nano /etc/default/grub
+# change e.g. from:
+#   GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"
+# to:
+#   GRUB_CMDLINE_LINUX_DEFAULT="quiet splash systemd.unit=multi-user.target"
+sudo update-grub
+sudo reboot</pre>
+    <p>To undo, remove the <code>systemd.unit=...</code> token and
+    <code>sudo update-grub</code> again.</p>
+
+    <h3>Option D — Drop to TTY in the running session (no reboot)</h3>
+<pre>sudo systemctl isolate multi-user.target     # stops X / Wayland *now*
+sudo systemctl isolate graphical.target      # brings the desktop back</pre>
+    <div class="warning">
+        Option D kills your graphical session immediately. Save your work
+        first. If you are connected over SSH this is fine — your SSH
+        session lives in <code>multi-user.target</code> and will survive.
+    </div>
+
+    <div class="note">
+        Inside a TTY you log in with your normal username and password.
+        Switch between virtual terminals with <strong>Ctrl-Alt-F2</strong>
+        through <strong>Ctrl-Alt-F6</strong>. The desktop, when it is
+        running, usually lives on <strong>Ctrl-Alt-F1</strong> or
+        <strong>F7</strong>.
+    </div>
+</div>
+
+<h2 id="driver">8. Reinstall the NVIDIA driver (.run + MOK + Secure Boot)</h2>
+<div class="step">
+    <p>This repository ships
+    <a href="driver-install.sh"><code>driver-install.sh</code></a>, which
+    wraps the upstream NVIDIA <code>.run</code> installer with:</p>
+    <ul>
+        <li>auto-detection of the <code>.run</code> file in the current
+            directory (no hard-coded version);</li>
+        <li>generation of a Machine Owner Key (MOK) if you don't already
+            have one, plus an enrolment walk-through via
+            <code>mokutil --import</code> when Secure Boot is on;</li>
+        <li>GPU-generation detection: it will refuse to pass
+            <code>--kernel-module-type=open</code> on Pascal / Maxwell
+            / Kepler hardware (where the open modules do not work) and
+            fall back to the closed modules automatically;</li>
+        <li>a guided step that walks you through booting to a TTY
+            (section 7) before swapping out the in-use kernel modules.</li>
+    </ul>
+
+    <p>Typical run:</p>
+<pre># Download the .run installer from
+#   https://www.nvidia.com/Download/index.aspx
+# into the current directory, then:
+sudo ./driver-install.sh</pre>
+
+    <p>Useful flags:</p>
+    <ul>
+        <li><code>--setup-mok</code> — only generate the MOK keypair and
+            kick off enrolment, then exit. Reboot, complete enrolment in
+            the blue MokManager screen, then rerun the script for real.</li>
+        <li><code>--open</code> / <code>--proprietary</code> — force the
+            kernel-module flavour.</li>
+        <li><code>--skip-isolate</code> — don't offer to switch to
+            <code>multi-user.target</code> (assumes you already did).</li>
+        <li><code>/path/to/NVIDIA.run</code> — pass the installer
+            explicitly if you have several .run files in the directory.</li>
+    </ul>
+
+    <div class="warning">
+        If Secure Boot is on, <strong>do not skip MOK enrolment</strong>. A
+        signed module whose certificate is not in shim's MOK list will be
+        silently rejected at <code>modprobe</code> time and
+        <code>nvidia-smi</code> will tell you the driver is not loaded.
+        Verify with:
+<pre>sudo mokutil --sb-state          # "SecureBoot enabled"?
+sudo mokutil --list-enrolled | grep -i 'Local NVIDIA'</pre>
+    </div>
+</div>
+
+<h2 id="cuda">9. Reinstall CUDA / cuDNN (optional)</h2>
 <div class="step">
     <p>Only after the purge in step 6 has succeeded. Install the CUDA toolkit
     version you actually want from
@@ -336,7 +459,36 @@ sudo apt install -y cudnn</pre>
     </div>
 </div>
 
-<h2 id="final">8. Final cleanup and sanity check</h2>
+<h2 id="gui">10. Fix a broken <code>nvidia-settings</code> GUI (optional)</h2>
+<div class="step">
+    <p>Some Ubuntu releases shipped an <code>nvidia-settings</code> package
+    (the 510 / 590 series) that crashes with
+    <em>double free or corruption (!prev)</em> the moment you click
+    <strong>Save Current Configuration</strong>. The fix is to replace it
+    with the binary and GTK panel libraries from the upstream .run
+    installer.</p>
+
+    <p>This repo ships
+    <a href="fix_nvidia_gui_v2.sh"><code>fix_nvidia_gui_v2.sh</code></a>,
+    which does this properly with <code>dpkg-divert</code> (so apt cannot
+    silently undo it) and <code>apt-mark hold</code> (so package upgrades
+    will not put it back). It also has a working <code>revert</code> path.</p>
+
+<pre>sudo ./fix_nvidia_gui_v2.sh install   # auto-detects .run in current dir
+sudo ./fix_nvidia_gui_v2.sh status    # show what is currently diverted
+sudo ./fix_nvidia_gui_v2.sh revert    # restore the apt-shipped files</pre>
+
+    <div class="warning">
+        Do <strong>not</strong> run
+        <code>apt --reinstall install nvidia-settings</code> after using
+        this script — that is exactly what the diversion is protecting
+        against. If you need to update <code>nvidia-settings</code>, run
+        <code>revert</code> first, do your update, then run
+        <code>install</code> again with the matching .run file.
+    </div>
+</div>
+
+<h2 id="final">11. Final cleanup and sanity check</h2>
 <div class="step">
 <pre>sudo apt update
 sudo apt full-upgrade -y
