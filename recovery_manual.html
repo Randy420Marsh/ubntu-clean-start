@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ubuntu 22.04 to 24.04 Failed Upgrade Recovery Manual</title>
+    <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; max-width: 1000px; margin: 0 auto; padding: 20px; background: #f4f4f4; color: #333; }
+        h1, h2, h3 { color: #2c3e50; }
+        pre { background: #2c3e50; color: #fff; padding: 15px; border-radius: 8px; overflow-x: auto; }
+        code { font-family: monospace; }
+        .warning { background: #ffeaea; border-left: 6px solid #e74c3c; padding: 15px; margin: 20px 0; }
+        .note { background: #fff8dc; border-left: 6px solid #d4a017; padding: 15px; margin: 20px 0; }
+        .success { background: #e8f5e8; border-left: 6px solid #27ae60; padding: 15px; margin: 20px 0; }
+        .step { background: white; padding: 20px; margin: 20px 0; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+        ul, ol { line-height: 1.8; }
+        .toc { background: #ecf0f1; padding: 15px; border-radius: 8px; }
+    </style>
+</head>
+<body>
+
+<h1>Ubuntu 22.04 to 24.04 Failed Release Upgrade Recovery Manual</h1>
+<p>This guide walks you through recovering from a failed <code>do-release-upgrade</code>
+that left you with no network, broken packages, double GNOME panels, or a
+half-installed NVIDIA / CUDA stack — and ends with a clean, stable Ubuntu 24.04
+desktop or headless server.</p>
+
+<div class="note">
+<strong>Before you start.</strong> Every step assumes you have a current backup
+of <code>/home</code>, <code>/etc</code>, and anything else you care about. Several
+sections delete files. Don't run them blind.
+</div>
+
+<div class="toc">
+    <h2>Table of Contents</h2>
+    <ol>
+        <li><a href="#liveusb">1. Boot a Ubuntu 24.04 Live USB and chroot</a></li>
+        <li><a href="#fixpackages">2. Fix broken packages inside the chroot</a></li>
+        <li><a href="#sources">3. Clean APT sources (jammy to noble)</a></li>
+        <li><a href="#reboot">4. Leave the chroot, unmount, reboot, verify</a></li>
+        <li><a href="#gnome">5. Fix the GNOME desktop (double panel, extensions)</a></li>
+        <li><a href="#nvidia">6. Purge old NVIDIA / CUDA / cuDNN safely</a></li>
+        <li><a href="#cuda">7. Reinstall CUDA / cuDNN (optional)</a></li>
+        <li><a href="#final">8. Final cleanup and sanity check</a></li>
+    </ol>
+</div>
+
+<h2 id="liveusb">1. Boot a Ubuntu 24.04 Live USB and chroot</h2>
+<div class="step">
+    <ol>
+        <li>Download the official Ubuntu 24.04 Desktop ISO and write it to a USB
+            (Rufus, balenaEtcher, <code>dd</code>, etc.).</li>
+        <li>Boot the USB and choose <strong>Try Ubuntu</strong>.</li>
+        <li>Open Terminal and identify your installed root partition:
+<pre>lsblk -f</pre>
+            Look for the largest <code>ext4</code> partition that has your
+            existing system. If you have a separate <code>/boot</code> or
+            <code>/boot/efi</code>, note them too.</li>
+        <li>Mount the root partition. Replace <code>sdXY</code> with your
+            actual device (e.g. <code>nvme0n1p2</code>):
+<pre>sudo mount /dev/sdXY /mnt</pre>
+        </li>
+        <li>If you have a separate <code>/boot</code> and / or an EFI System
+            Partition, mount them <em>inside</em> the new root so that
+            <code>grub-install</code> and <code>update-initramfs</code> can do
+            their job:
+<pre>sudo mount /dev/sdXZ /mnt/boot           # only if separate /boot exists
+sudo mount /dev/sdXW /mnt/boot/efi       # only if EFI partition exists</pre>
+        </li>
+        <li>Bind-mount the kernel virtual filesystems, copy DNS, and chroot in:
+<pre>for d in dev dev/pts proc sys run; do
+    sudo mount --bind /$d /mnt/$d
+done
+sudo cp /etc/resolv.conf /mnt/etc/resolv.conf
+sudo chroot /mnt /bin/bash</pre>
+        </li>
+    </ol>
+    <div class="warning">
+        <strong>LVM, LUKS, or Btrfs root?</strong> The plain
+        <code>mount /dev/sdXY /mnt</code> recipe will not work. You need to
+        unlock the LUKS container first (<code>cryptsetup luksOpen ...</code>),
+        activate the LVM volume group (<code>vgchange -ay</code>), or mount the
+        correct Btrfs subvolume (<code>mount -o subvol=@ /dev/... /mnt</code>).
+        If you are not sure, ask before continuing.
+    </div>
+</div>
+
+<h2 id="fixpackages">2. Fix broken packages inside the chroot</h2>
+<div class="step">
+    <p>Run these in order, inside the chroot:</p>
+<pre>dpkg --configure -a
+apt --fix-broken install -y</pre>
+
+    <div class="warning">
+        <strong>About removing third-party DKMS drivers.</strong> A
+        widely-shared recipe for fixing failed Jammy upgrades tells you to
+        purge <code>v4l2loopback-dkms</code>, <code>rtl8812au-dkms</code>,
+        <code>8188eu-dkms</code>, and <code>ax88179a-dkms</code> outright. Only
+        do that if you know you do not depend on them. Specifically:
+        <ul>
+            <li><code>rtl8812au-dkms</code> drives many USB WiFi adapters
+                (Alfa, TP-Link Archer T-series, etc.). Removing it can leave
+                your laptop with no WiFi after reboot.</li>
+            <li><code>ax88179a-dkms</code> drives ASIX AX88179 / AX88179A USB
+                3 Gigabit ethernet adapters.</li>
+            <li><code>8188eu-dkms</code> drives RTL8188EU-based USB WiFi.</li>
+            <li><code>v4l2loopback-dkms</code> is needed by OBS Virtual Camera,
+                Snap Camera, etc.</li>
+        </ul>
+        Check first with <code>lsmod | grep -E 'rtl|ax88|8188|v4l2loopback'</code>
+        and <code>lsusb</code>. Only purge the ones you do not use.
+    </div>
+
+    <p>Then, only for modules you do not need, purge them one at a time:</p>
+<pre># Example — adapt to your hardware:
+apt purge -y v4l2loopback-dkms
+apt purge -y 8188eu-dkms
+apt --fix-broken install -y</pre>
+
+    <p>If you hit a <code>libslang2-dev</code> overwrite error (a known Jammy
+    to Noble upgrade bug), force the overwrite:</p>
+<pre>dpkg -i --force-overwrite /var/cache/apt/archives/libslang2-dev_*.deb
+apt --fix-broken install -y</pre>
+</div>
+
+<h2 id="sources">3. Clean APT sources (jammy to noble)</h2>
+<div class="step">
+    <div class="warning">
+        <strong>Do not</strong> restore <code>/etc/apt/sources.list.distUpgrade</code>
+        on top of <code>/etc/apt/sources.list</code>. That file is a
+        <em>backup of the pre-upgrade jammy sources</em> that
+        <code>do-release-upgrade</code> saves so you can roll back. Copying it
+        over the live sources will pin you back to jammy, which is the opposite
+        of what we want.
+    </div>
+
+    <p>On Ubuntu 24.04 the primary sources file is the deb822-format
+    <code>/etc/apt/sources.list.d/ubuntu.sources</code>, not the legacy
+    <code>/etc/apt/sources.list</code>. Handle both:</p>
+
+<pre># Back up everything first so you can always revert.
+mkdir -p /root/apt-backup-$(date +%Y%m%d)
+cp -a /etc/apt/sources.list /etc/apt/sources.list.d /root/apt-backup-$(date +%Y%m%d)/ 2&gt;/dev/null || true
+
+# If you have the deb822 file, make sure it points at noble.
+if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+    sed -i 's/\bjammy\b/noble/g' /etc/apt/sources.list.d/ubuntu.sources
+fi
+
+# Rewrite any remaining legacy lists.
+if [ -f /etc/apt/sources.list ]; then
+    sed -i 's/\bjammy\b/noble/g' /etc/apt/sources.list
+fi
+
+# Third-party PPAs and .sources files: only rewrite jammy to noble if the
+# upstream actually has a noble repo. If you are not sure, comment the line
+# out instead (prefix with #) and re-enable it later.
+shopt -s nullglob
+for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+    [ "$f" = "/etc/apt/sources.list.d/ubuntu.sources" ] &amp;&amp; continue
+    echo "Review: $f"
+    grep -nH 'jammy' "$f" || true
+done
+shopt -u nullglob</pre>
+
+    <p>Once the sources are sane, refresh and upgrade:</p>
+<pre>rm -rf /var/lib/apt/lists/*
+apt clean
+apt update
+apt full-upgrade -y
+apt autoremove -y
+apt --fix-broken install -y</pre>
+</div>
+
+<h2 id="reboot">4. Leave the chroot, unmount, reboot, verify</h2>
+<div class="step">
+<pre>exit                              # leave the chroot
+sudo umount -R /mnt               # recursive — handles /dev/pts, /boot/efi, etc.
+sudo reboot</pre>
+
+    <p>If <code>umount -R</code> complains about busy mounts, find what is
+    using them:</p>
+<pre>sudo lsof +D /mnt 2&gt;/dev/null
+sudo fuser -vm /mnt</pre>
+
+    <p>After reboot, check:</p>
+<pre>lsb_release -a
+systemctl status NetworkManager      # or systemd-networkd
+ping -c 3 1.1.1.1</pre>
+</div>
+
+<h2 id="gnome">5. Fix the GNOME desktop (double panel, extensions)</h2>
+<div class="step">
+    <p>If you have a double bottom panel, ghost docks, or generally broken
+    extensions, reset the user-level state:</p>
+<pre># Remove user-installed extensions (system extensions in /usr/share are left alone).
+rm -rf ~/.local/share/gnome-shell/extensions/*
+rm -rf ~/.cache/gnome-shell
+
+# Disable everything that is currently enabled, then let GNOME re-enable
+# the defaults on next login.
+gsettings set org.gnome.shell enabled-extensions "[]"
+gsettings set org.gnome.shell disabled-extensions "[]"
+
+# Wipe dconf state for extensions.
+dconf reset -f /org/gnome/shell/extensions/</pre>
+
+    <div class="warning">
+        <code>gnome-extensions reset</code> is <strong>not</strong> a real
+        subcommand. Older guides recommend it; it just prints
+        <code>command not found</code> for <code>reset</code>. Use the
+        <code>gsettings</code> / <code>dconf</code> commands above instead.
+    </div>
+
+    <p>Now log out and log back in. On Wayland sessions, do not run
+    <code>systemctl restart gdm</code> — that will kill your session
+    abruptly and can leave your user bus in a weird state. Use the regular
+    Log Out option, or from a TTY:</p>
+<pre>loginctl terminate-user "$USER"</pre>
+
+    <p class="success">After logging back in you should have a clean default
+    GNOME shell with only the top bar and the standard Ubuntu dock.</p>
+</div>
+
+<h2 id="nvidia">6. Purge old NVIDIA / CUDA / cuDNN safely</h2>
+<div class="step">
+    <p>This repository ships a hardened purge script,
+    <a href="safe_clean_nvidia.sh"><code>safe_clean_nvidia.sh</code></a>,
+    designed to be safe on a headless server over SSH. It will:</p>
+    <ul>
+        <li>stop any active display manager (gdm3 / sddm / lightdm), if one exists;</li>
+        <li>unload <code>nvidia</code>, <code>nvidia_drm</code>,
+            <code>nvidia_modeset</code>, <code>nvidia_uvm</code>, and
+            <code>nvidia_peermem</code> before purge;</li>
+        <li>purge every <code>nvidia-*</code>, <code>libnvidia-*</code>,
+            <code>cuda-*</code>, <code>libcudnn*</code>, <code>libcublas*</code>,
+            <code>libcufft*</code>, <code>libcurand*</code>, <code>libcusolver*</code>,
+            <code>libcusparse*</code>, <code>libnpp*</code>, <code>libnccl*</code>,
+            <code>libnvjpeg*</code>, <code>libnvinfer*</code>,
+            <code>libcutensor*</code>, <code>tensorrt*</code>, and
+            <code>xserver-xorg-video-nvidia*</code> package;</li>
+        <li>delete CUDA / NVIDIA apt sources, signing keys, residual
+            <code>/usr/local/cuda*</code>, <code>/usr/src/nvidia-*</code>,
+            <code>/etc/ld.so.conf.d/cuda*.conf</code>,
+            <code>/etc/profile.d/cuda*.sh</code>,
+            <code>/etc/modprobe.d/nvidia*.conf</code>,
+            and <code>/etc/OpenCL/vendors/nvidia.icd</code>;</li>
+        <li>remove only the <code>rc</code>-state packages that are clearly
+            NVIDIA / CUDA related (it does <strong>not</strong> blanket-purge
+            every <code>rc</code> package on the system);</li>
+        <li>back up <code>/etc/X11/xorg.conf</code> if it references the
+            <code>nvidia</code> driver, rather than deleting it outright;</li>
+        <li>refresh <code>ldconfig</code> at the end.</li>
+    </ul>
+
+    <p>Run it with <code>--dry-run</code> first to see exactly what it will
+    touch:</p>
+<pre>sudo ./safe_clean_nvidia.sh --dry-run</pre>
+
+    <p>Then run for real:</p>
+<pre>sudo ./safe_clean_nvidia.sh</pre>
+
+    <p>Optional flags:</p>
+    <ul>
+        <li><code>--restore-nouveau</code> — also remove
+            <code>/etc/modprobe.d/blacklist-nouveau.conf</code> and rebuild
+            initramfs so the open-source <code>nouveau</code> driver loads
+            again on reboot.</li>
+        <li><code>--purge-extra-dkms</code> — also remove
+            <code>v4l2loopback-dkms</code>, <code>rtl8812au-dkms</code>,
+            <code>8188eu-dkms</code>, and <code>ax88179a-dkms</code>. Only use
+            this if you have confirmed you do not depend on those drivers (see
+            <a href="#fixpackages">section 2</a>).</li>
+        <li><code>-y</code> / <code>--yes</code> — non-interactive; skip the
+            reboot prompt and exit. Useful for SSH automation.</li>
+    </ul>
+
+    <div class="warning">
+        The script never silently removes WiFi / USB-ethernet / virtual-camera
+        drivers, never blanket-purges all <code>rc</code> packages, and never
+        deletes <code>blacklist-nouveau.conf</code> unless you explicitly ask
+        for it. These are the three real footguns in most public NVIDIA
+        cleanup scripts.
+    </div>
+</div>
+
+<h2 id="cuda">7. Reinstall CUDA / cuDNN (optional)</h2>
+<div class="step">
+    <p>Only after the purge in step 6 has succeeded. Install the CUDA toolkit
+    version you actually want from
+    <a href="https://developer.nvidia.com/cuda-downloads">NVIDIA's download
+    page</a> — pick the Linux / Ubuntu 24.04 / deb (network or local) variant
+    and follow the exact commands NVIDIA shows for that version. They change
+    per release, so do not hard-code them in a script.</p>
+
+    <p>If you have several CUDA versions installed side by side, switch
+    between them by repointing the <code>/usr/local/cuda</code> symlink:</p>
+<pre>sudo rm -f /usr/local/cuda
+sudo ln -s /usr/local/cuda-13.1 /usr/local/cuda    # adjust version</pre>
+
+    <p>Put the environment variables in a <em>system-wide</em>, idempotent
+    profile snippet so you do not keep appending to <code>~/.bashrc</code>
+    every time you reinstall:</p>
+<pre>sudo tee /etc/profile.d/cuda.sh &gt;/dev/null &lt;&lt;'EOF'
+if [ -d /usr/local/cuda/bin ]; then
+    case ":$PATH:" in
+        *:/usr/local/cuda/bin:*) ;;
+        *) export PATH="/usr/local/cuda/bin:$PATH" ;;
+    esac
+fi
+if [ -d /usr/local/cuda/lib64 ]; then
+    case ":${LD_LIBRARY_PATH:-}:" in
+        *:/usr/local/cuda/lib64:*) ;;
+        *) export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" ;;
+    esac
+fi
+EOF
+sudo chmod 0644 /etc/profile.d/cuda.sh</pre>
+
+    <p>Then install cuDNN that matches your CUDA major version. For cuDNN 9.x
+    on Ubuntu 24.04 (adjust the version in the filename to the latest at
+    <a href="https://developer.nvidia.com/cudnn-downloads">developer.nvidia.com/cudnn-downloads</a>):</p>
+
+<pre># Replace 9.5.1 with whatever the current cuDNN download page lists.
+CUDNN_VER=9.5.1
+wget "https://developer.download.nvidia.com/compute/cudnn/${CUDNN_VER}/local_installers/cudnn-local-repo-ubuntu2404-${CUDNN_VER}_1.0-1_amd64.deb"
+sudo dpkg -i "cudnn-local-repo-ubuntu2404-${CUDNN_VER}_1.0-1_amd64.deb"
+sudo cp /var/cudnn-local-repo-ubuntu2404-${CUDNN_VER}/cudnn-*-keyring.gpg /usr/share/keyrings/
+sudo apt update
+sudo apt install -y cudnn</pre>
+
+    <div class="note">
+        Always confirm the exact filename on the cuDNN download page before
+        copying that <code>wget</code> URL — NVIDIA rotates filenames per
+        release. If the URL 404s, you have the wrong version string.
+    </div>
+</div>
+
+<h2 id="final">8. Final cleanup and sanity check</h2>
+<div class="step">
+<pre>sudo apt update
+sudo apt full-upgrade -y
+sudo apt autoremove --purge -y
+sudo apt --fix-broken install -y
+sudo ldconfig
+sudo reboot</pre>
+
+    <p>After the final reboot, run:</p>
+<pre>lsb_release -a                       # should say 24.04 / noble
+ip -brief addr                       # network up?
+systemctl status NetworkManager      # or systemd-networkd
+nvidia-smi                           # only if you reinstalled the driver
+nvcc --version                       # only if you reinstalled the toolkit</pre>
+
+    <p class="success">If all four return what you expect, the recovery is done.</p>
+</div>
+
+</body>
+</html>
