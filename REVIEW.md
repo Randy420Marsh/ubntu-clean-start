@@ -919,3 +919,92 @@ documentation gaps surfaced from the output and were patched:
      running without an OS-side microcode update. They are not a
      regression but the documented consequence of accepting the
      limited-BIOS-ROM tradeoff.
+
+---
+
+## Part H — dbx regrowth + BIOS-race enrolment workflow
+
+User-reported follow-up to Part G. After clearing `dbx` in BIOS and
+masking `fwupd-refresh.timer`, the user discovered that **`dbx`
+regrows back to ~17 KB on every reboot anyway**, blocking
+`mokutil --import` again. They worked out an empirical "BIOS-race"
+sequence that gets a single MOK enrolled by tapping the BIOS hotkey
+*before* shim launches MokManager, clearing `dbx` from BIOS Setup,
+saving, and only then letting the MokManager screen appear.
+
+Two new sub-sections of recovery_manual §10:
+
+### H1. Step 7 — find what is regrowing `dbx` at every boot
+
+Three candidates documented in priority order:
+
+1. **`secureboot-db` package.** Ships
+   `/usr/share/secureboot-db/dbx.esl`; its `secureboot-db.service`
+   oneshot runs at boot and writes the blob to firmware via
+   `update-secureboot-policy`. Disabled by `systemctl disable --now
+   secureboot-db.service && systemctl mask secureboot-db.service`.
+   Most likely culprit on stock Ubuntu 24.04 desktop installs.
+2. **`fwupd` daemon (not just the refresh timer).** Even with
+   `fwupd-refresh.timer` masked, `fwupd.service` can apply a
+   previously-downloaded dbx update on start. Mask the daemon too,
+   or `apt purge fwupd fwupd-signed` if not needed.
+3. **Shim auto-enroll path.** `MOK_AUTO_ENROLL=1` baked into some
+   third-party shim builds. Detect with
+   `strings /usr/lib/shim/shimx64.efi.signed | grep MOK_AUTO`. Rare
+   on Ubuntu stock shim.
+
+Plus diagnostic commands:
+- `ls -l /sys/firmware/efi/efivars/dbx-*` immediately after a fresh
+  boot (size delta tells you whether boot itself grew it);
+- `journalctl -b -0 | grep -iE 'dbx|secureboot|mok|efivar'` to see
+  which service touched NVRAM;
+- `find /usr/share /usr/lib /var/lib -name 'dbx*.esl' -o -name
+  'dbx*.bin'` to find any blob shipped by a package.
+
+### H2. Step 8 — BIOS-race workflow
+
+Nine-step empirical procedure that the user confirmed works on the
+ASRock Z170 PG. The key insight is that the BIOS dbx-clear has to
+happen *between* `mokutil`-side scheduling (which writes `MokNew`)
+and shim's MokManager launch — i.e. before the next cold boot
+reaches shim. The hotkey-spam-during-POST timing is what makes it
+work on a board where shim auto-launches MokManager too quickly.
+
+Sequence:
+
+1. `sudo mokutil --reset` (sets one-time password, schedules reset)
+2. Reboot, spam BIOS hotkey before shim launches
+3. BIOS → Security → Secure Boot → Key Management → DBX → Delete
+4. Reboot to GRUB → append `3` to cmdline → multi-user.target
+5. `sudo ./driver-install.sh --setup-mok` (queues `MokNew`)
+6. Reboot, spam BIOS hotkey again, clear DBX again
+7. MokManager finally has room: Enroll MOK → password
+8. Boot to verify with `mokutil --list-enrolled` and
+   `mokutil --test-key`
+9. Run `sudo ./driver-install.sh` for the actual driver install -
+   the script's `ensure_mok_enrolled()` calls `mokutil --test-key`
+   first and skips the import entirely when the MOK is already
+   enrolled, so the install itself cannot hit "MOK storage full"
+   again
+
+Explicit warning block at the end: the BIOS-race workflow is a
+coping mechanism for the *symptom*, not a fix for the *cause*. Every
+cold boot still regrows `dbx` until Step 7 is completed. Use it to
+get back to a working GUI so Step 7 can be diagnosed comfortably,
+not as a permanent operating mode.
+
+### H3. driver-install.sh `ensure_mok_enrolled()` — no change needed
+
+The script was already correct on this front:
+
+```
+if mokutil --test-key "$MOK_CRT" 2>&1 | grep -qi 'is already enrolled'; then
+  log "MOK is already enrolled in shim — good."
+  return 0
+fi
+```
+
+So a second run after the BIOS-race workflow short-circuits before
+`mokutil --import` and does not push any new variable into NVRAM.
+This is the property that makes the "enrol first, install driver
+second" ordering safe even on a regrowing-dbx board.
