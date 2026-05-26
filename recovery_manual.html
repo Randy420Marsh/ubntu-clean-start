@@ -461,6 +461,89 @@ dmesg | grep -iE 'microcode|ucode'</pre>
         affecting your specific stepping (<code>cat /proc/cpuinfo | grep
         -m1 -E 'model|stepping'</code>).
     </div>
+
+    <h3>Verifying microcode is no longer loaded at boot</h3>
+    <p>After purging <code>intel-microcode</code> (Option B) or adding
+    <code>dis_ucode_ldr</code> (Option A), microcode can still be
+    applied at boot from any of these six places. Run the checks
+    below; they confirm whether the kernel is still loading a blob.</p>
+
+    <p>Important context: the BIOS itself <em>always</em> applies the
+    microcode it was shipped with at power-on, regardless of OS — CPU
+    microcode is volatile and has to be reloaded every cold boot. The
+    OS-side loader's only job is to <em>override</em> the BIOS-baked
+    microcode with a newer revision after boot. "Disabling microcode"
+    therefore means "do not let the OS override the BIOS revision",
+    not "run the CPU with no microcode at all" (which is not a thing).</p>
+
+<pre># 1. What the running kernel actually did this boot. Look for
+#    "microcode updated early to revision 0x..." or "microcode patch
+#    loaded". If you see neither, the kernel did not override the
+#    BIOS-baked microcode. If you see "early microcode loader: lookup
+#    failed", that is also fine - it tried, found nothing, gave up.
+sudo dmesg | grep -iE 'microcode|ucode'
+
+# 2. Current revision running on the CPU. Compare with the "CPU
+#    Microcode Revision" / "Microcode Patch ID" line in BIOS Setup.
+grep -i microcode /proc/cpuinfo | head -1
+cat /sys/devices/system/cpu/microcode/version 2>/dev/null
+
+# 3. Kernel command line as actually applied. If you used Option A
+#    you must see "dis_ucode_ldr" here. If not, /etc/default/grub was
+#    not saved, or update-grub was not run, or you booted an old
+#    GRUB entry.
+cat /proc/cmdline
+
+# 4. Microcode firmware files still on disk?
+ls -la /lib/firmware/intel-ucode/ 2>/dev/null
+ls -la /lib/firmware/amd-ucode/   2>/dev/null
+sudo find / -xdev -type f \( -name '*ucode*' -o -name '*microcode*' \) \
+    2>/dev/null | grep -v -E '/(proc|sys|run)/'
+
+# 5. GRUB-style early microcode image in /boot?
+ls -la /boot/intel-ucode.img /boot/amd-ucode.img 2>/dev/null
+
+# 6. Initramfs for the running kernel still bundling microcode?
+sudo lsinitramfs /boot/initrd.img-$(uname -r) 2>/dev/null \
+    | grep -iE 'ucode|microcode'
+
+# 7. Does grub.cfg still chainload a microcode image?
+sudo grep -niE 'ucode|microcode' /boot/grub/grub.cfg \
+    /etc/grub.d/*microcode* 2>/dev/null
+
+# 8. Any microcode-related packages or services still installed?
+dpkg -l | grep -iE 'microcode|ucode|iucode'
+systemctl list-unit-files | grep -iE 'microcode|ucode'</pre>
+
+    <p>How to clean up each remaining loader:</p>
+    <ul>
+        <li>Check #4 lists files in <code>/lib/firmware/intel-ucode/</code>:
+            <code>sudo rm -rf /lib/firmware/intel-ucode</code> is safe
+            after the package is purged.</li>
+        <li>Check #5 returns <code>/boot/intel-ucode.img</code>:
+<pre>sudo rm -f /boot/intel-ucode.img
+sudo update-grub</pre></li>
+        <li>Check #6 lists
+            <code>kernel/x86/microcode/GenuineIntel.bin</code>:
+            initramfs is still bundling microcode. Force a rebuild:
+<pre>sudo update-initramfs -u -k all</pre></li>
+        <li>Check #7 returns matches in
+            <code>/boot/grub/grub.cfg</code>:
+            after the above two cleanups, regenerate the GRUB config:
+<pre>sudo update-grub</pre></li>
+        <li>Check #8 lists anything other than <code>iucode-tool</code>
+            (which is just the tool, not firmware):
+<pre>sudo apt purge intel-microcode amd64-microcode iucode-tool</pre></li>
+        <li>Check #3 is missing <code>dis_ucode_ldr</code>: redo
+            Option A — edit <code>/etc/default/grub</code>,
+            <code>sudo update-grub</code>, reboot.</li>
+    </ul>
+
+    <p>Once all eight checks come back clean, the CPU is running on
+    whatever microcode revision the BIOS shipped with — verified in #2
+    by matching it against the BIOS Setup "CPU Microcode Revision"
+    value. From the BIOS-vendor perspective this is exactly the
+    pre-Plundervolt configuration the Z170 PG was tested against.</p>
 </div>
 
 <h2 id="driver">9. Reinstall the NVIDIA driver (.run + MOK + Secure Boot)</h2>

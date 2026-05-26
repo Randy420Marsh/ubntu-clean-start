@@ -842,3 +842,44 @@ between Step 1 (diagnose) and Step 2 (pstore) covering:
 The original numbered root-cause list at the top of section 10 was
 extended from four causes to five, with the oversized `dbx` listed
 first as the most common Skylake-era ASRock culprit.
+
+### G9. Section 8: "Verifying microcode is no longer loaded at boot"
+
+User follow-up: after purging `intel-microcode` and adding the
+`dis_ucode_ldr` kernel command line, how do you actually verify the
+OS-side microcode loader is gone? The Z170 PG has a ~20 KB NVRAM
+ceiling (per user-reported BIOS metric), so any wasted boot-time
+operation matters.
+
+New sub-section in section 8 walks through eight diagnostic checks
+covering every place microcode can still be applied at boot:
+
+1. `dmesg | grep -iE 'microcode|ucode'` — what the kernel did this
+   boot. "microcode updated early to revision 0x..." means the kernel
+   overrode the BIOS-baked microcode; "early microcode loader: lookup
+   failed" or no microcode-related output at all means the kernel
+   did not override.
+2. `/proc/cpuinfo` `microcode:` line + `/sys/devices/system/cpu/`
+   `microcode/version` — current revision running on the CPU.
+   Compare with the "CPU Microcode Revision" line in BIOS Setup.
+3. `/proc/cmdline` — confirms `dis_ucode_ldr` is actually applied.
+4. `/lib/firmware/intel-ucode/`, `/lib/firmware/amd-ucode/`, and a
+   filesystem-wide `find` for `*ucode*` / `*microcode*` files.
+5. `/boot/intel-ucode.img` and `/boot/amd-ucode.img` — the GRUB-style
+   early microcode image that GRUB chainloads before the kernel.
+6. `lsinitramfs /boot/initrd.img-$(uname -r) | grep -iE 'ucode|microcode'`
+   — initramfs may still bundle `kernel/x86/microcode/GenuineIntel.bin`
+   despite the package being purged.
+7. `/boot/grub/grub.cfg` and `/etc/grub.d/*microcode*` — GRUB config
+   may still chainload an image.
+8. `dpkg -l | grep -iE 'microcode|ucode|iucode'` and
+   `systemctl list-unit-files | grep -iE 'microcode|ucode'` —
+   remaining packages or services.
+
+Each check has a documented cleanup recipe. Includes an explicit
+explanation of the underlying physics: CPU microcode is volatile and
+must be reloaded every cold boot; the BIOS always applies its baked
+revision first; "disabling microcode" only means "do not let the OS
+override the BIOS revision", not "run with no microcode at all"
+(which is impossible). Eliminates the common misunderstanding where
+users expect `/proc/cpuinfo` to show revision 0 after `apt purge`.
