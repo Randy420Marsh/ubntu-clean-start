@@ -1008,3 +1008,83 @@ So a second run after the BIOS-race workflow short-circuits before
 `mokutil --import` and does not push any new variable into NVRAM.
 This is the property that makes the "enrol first, install driver
 second" ordering safe even on a regrowing-dbx board.
+
+---
+
+## Part I — pre-flight DKMS cleanup in driver-install.sh
+
+User-reported failure on re-running the installer after the BIOS-race
+MOK enrolment workflow (Part H) succeeded. The `.run` installer's
+DKMS step aborted with a wall of:
+
+```
+ERROR: Failed to run `/usr/sbin/dkms install --no-depmod -m nvidia -v 595.71.05 -k 6.8.0-117-lowlatency`:
+       Module .../nvidia.ko.zst already installed at version 595.71.05, override by specifying --force
+       Module .../nvidia-uvm.ko.zst already installed at version 595.71.05, override by specifying --force
+       Module .../nvidia-modeset.ko.zst already installed at version 595.71.05, override by specifying --force
+       Module .../nvidia-drm.ko.zst already installed at version 595.71.05, override by specifying --force
+       Module .../nvidia-peermem.ko.zst already installed at version 595.71.05, override by specifying --force
+       Error! Installation aborted.
+```
+
+Root cause: a prior installer run had already built and DKMS-installed
+the modules at version 595.71.05 under
+`/lib/modules/$(uname -r)/updates/dkms/`. The upstream `.run` installer
+does not expose `--force` for its embedded DKMS step, so the second
+run cannot overwrite. This is the expected DKMS collision-prevention
+behaviour, but on a re-install workflow (e.g. after failing to load
+under Secure Boot the first time) it blocks progress.
+
+### I1. driver-install.sh `clean_existing_dkms()`
+
+New pre-flight function inserted between the GPU-generation check and
+the display-server prep. It runs in four phases, all interactive
+(asks before deleting anything):
+
+1. **apt-managed NVIDIA dkms / source packages.** Detect
+   `nvidia-dkms-*`, `nvidia-kernel-source-*`, `libnvidia-cfg1`,
+   `libnvidia-extra-*` via `dpkg-query`. Even if these are not
+   currently building, they will re-build at the next `apt upgrade`
+   or kernel update and reintroduce the conflict. Offered to purge.
+2. **DKMS-tracked nvidia/* builds.** Parse `dkms status`, extract
+   each `module/version` pair (format varies across
+   Debian/Ubuntu/Pop!_OS versions, so we use a tolerant sed), and
+   run `dkms remove --all` on each.
+3. **Stale `.ko` / `.ko.zst` left behind in `/lib/modules` and
+   `/usr/lib/modules`.** Historically `dkms remove` does not always
+   delete these (Ubuntu 22.04 -> 24.04 dkms 2.x -> 3.x had a known
+   regression in this area), so we sweep with `find ... -delete`.
+4. **Refresh module dependency tree + initramfs** only if anything
+   was actually removed. Runs `depmod -a` for every kernel directory
+   and then `update-initramfs -u` so the kernel does not try to
+   autoload a module file that no longer exists.
+
+Phases 1 and 3 ask `ask_yn` before destructive action. Phases 2 and 4
+are idempotent and run unconditionally.
+
+The change is bundled into the same PR as the dbx-regrowth /
+BIOS-race documentation because the user hit this immediately after
+walking the BIOS-race workflow - both belong to the same end-to-end
+"get a working NVIDIA driver on a Z170 PG under Secure Boot" flow.
+
+### I2. recovery_manual section 9 - manual recipe documented
+
+A new sub-section under section 9 (driver install) documents the
+exact error output and gives the manual recipe (`dkms remove` ->
+`find ... -delete` -> `apt purge` -> `depmod -a` ->
+`update-initramfs -u` -> rerun). Includes a note block explaining
+*why* the conflict happens - DKMS sees its own prior install at the
+same version and refuses to overwrite - so the user understands that
+this is only a problem when reinstalling the same major version,
+not a permanent burden.
+
+### I3. Why this had to be in our wrapper, not "use --force"
+
+The `.run` installer accepts `--silent`, `--no-questions`,
+`--accept-license`, `--skip-module-load`, etc., but it does **not**
+forward `--force` to the embedded `dkms install` command. Passing
+`-- --force` or similar at the end of the .run argv does not work
+either; the DKMS sub-invocation is constructed inside
+`nvidia-installer` with a fixed argv. The only way to make the
+second run succeed is to remove the prior DKMS build before launching
+the installer. Hence the wrapper-level cleanup.

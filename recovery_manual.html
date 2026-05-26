@@ -639,6 +639,69 @@ sudo ./driver-install.sh</pre>
 <pre>sudo mokutil --sb-state          # "SecureBoot enabled"?
 sudo mokutil --list-enrolled | grep -i 'Local NVIDIA'</pre>
     </div>
+
+    <h3>Symptom: <code>dkms install</code> aborts with "already installed at
+        version X, override by specifying --force"</h3>
+    <p>If a prior run of the installer (or an apt-shipped
+    <code>nvidia-dkms-*</code> package) left modules in
+    <code>/lib/modules/$(uname -r)/updates/dkms/</code>, the next
+    <code>.run</code> install will fail with a wall of errors like:</p>
+<pre>ERROR: Failed to run `/usr/sbin/dkms install --no-depmod -m nvidia -v 595.71.05 -k 6.8.0-117-lowlatency`:
+       Module /lib/modules/6.8.0-117-lowlatency/updates/dkms/nvidia.ko.zst
+       already installed at version 595.71.05, override by specifying --force
+       Module .../nvidia-uvm.ko.zst already installed at version 595.71.05, override by specifying --force
+       Module .../nvidia-modeset.ko.zst already installed at version 595.71.05, override by specifying --force
+       Module .../nvidia-drm.ko.zst already installed at version 595.71.05, override by specifying --force
+       Module .../nvidia-peermem.ko.zst already installed at version 595.71.05, override by specifying --force
+       Error! Installation aborted.</pre>
+
+    <p>The upstream <code>.run</code> installer does not expose a knob
+    to pass <code>--force</code> through to DKMS, so the prior build
+    has to be removed first. <code>driver-install.sh</code> now does
+    this automatically before launching the installer (asks before
+    deleting anything). The manual recipe, in case you need to run it
+    standalone:</p>
+<pre># 1. Tell DKMS to remove the existing build (all kernels):
+sudo dkms status | grep -i '^nvidia'
+sudo dkms remove nvidia/&lt;version&gt; --all
+
+# 2. Sweep any .ko / .ko.zst left behind in /lib/modules and
+#    /usr/lib/modules - dkms remove does not always delete these:
+sudo find /lib/modules /usr/lib/modules -type f \
+    \( -name 'nvidia.ko*' \
+       -o -name 'nvidia-uvm.ko*' \
+       -o -name 'nvidia-modeset.ko*' \
+       -o -name 'nvidia-drm.ko*' \
+       -o -name 'nvidia-peermem.ko*' \) \
+    -delete
+
+# 3. If apt-shipped nvidia-dkms-* is installed alongside, purge it -
+#    it will re-build modules on every kernel update and reintroduce
+#    the conflict:
+dpkg -l | grep -E '^ii.*(nvidia-dkms-|nvidia-kernel-source-)'
+sudo apt purge 'nvidia-dkms-*' 'nvidia-kernel-source-*'
+
+# 4. Refresh module dependency tree + initramfs so the kernel does
+#    not try to autoload modules that no longer exist on disk:
+sudo depmod -a
+sudo update-initramfs -u
+
+# 5. Now rerun:
+sudo ./driver-install.sh /path/to/NVIDIA-Linux-x86_64-&lt;version&gt;.run</pre>
+
+    <div class="note">
+        Why the conflict happens in the first place: when you run the
+        <code>.run</code> installer once with <code>--dkms</code>, it
+        registers <code>nvidia/&lt;version&gt;</code> in the DKMS
+        database <em>and</em> builds + installs the modules under
+        <code>/lib/modules/$(uname -r)/updates/dkms/</code>. On a
+        second run with the <em>same</em> version, DKMS sees its own
+        prior install, treats it as a collision, and refuses. A
+        different version would not collide. The cleanup above is
+        therefore only required when reinstalling the same major
+        version, which is exactly the case after a failed Secure Boot
+        / MOK pass where the modules built but did not load.
+    </div>
 </div>
 
 <h2 id="mokfull">10. Troubleshooting: "MOK storage full" / EFI NVRAM exhausted</h2>
