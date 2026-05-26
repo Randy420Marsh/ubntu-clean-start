@@ -883,3 +883,39 @@ revision first; "disabling microcode" only means "do not let the OS
 override the BIOS revision", not "run with no microcode at all"
 (which is impossible). Eliminates the common misunderstanding where
 users expect `/proc/cpuinfo` to show revision 0 after `apt purge`.
+
+### G10. Section 8: usrmerge path + alarming-but-expected dmesg lines
+
+User ran the eight checks. Empirical Z170 PG output confirmed the
+loader is fully disabled (no "microcode updated early" line, kernel
+explicitly logs `dis_ucode_ldr` at ~[ 0.636 ], `/proc/cpuinfo`
+microcode is 0xc2 = BIOS-baked, `/boot/intel-ucode.img` absent). Two
+documentation gaps surfaced from the output and were patched:
+
+1. **usrmerge path.** Original Check #4 only listed
+   `/lib/firmware/intel-ucode/`. On Ubuntu 24.04 with usrmerge, the
+   canonical path is `/usr/lib/firmware/intel-ucode/` and
+   `plocate intel-ucode` will return that path, not the symlink. Both
+   paths are now listed (they resolve to the same directory after
+   usrmerge but it confuses readers when the documented path does not
+   match what `plocate` printed).
+
+2. **"Unknown kernel command line parameters" message** — an
+   inexperienced reader can easily mistake this for "the kernel
+   refused my microcode disable flag". A new sub-section *Expected-
+   but-alarming-looking dmesg lines* now explains:
+
+   - `dis_ucode_ldr` is registered as an `early_param`, parsed before
+     the core parser runs; the core parser's "unknown parameters"
+     message is just it disclaiming the tokens it does not own.
+     `text` and `3` are systemd shorthand for console-only +
+     multi-user.target, handled by systemd.
+   - The way to confirm the `dis_ucode_ldr` half actually fired is to
+     look for a later `dis_ucode_ldr` line in dmesg (typically around
+     `[ 0.6xx ]`) — which the user's screenshot showed at exactly
+     `[ 0.636141 ]`.
+   - The `MDS: Vulnerable: ... no microcode` / TAA / MMIO Stale Data
+     / SRBDS / GDS lines are *expected* on a Skylake-class CPU
+     running without an OS-side microcode update. They are not a
+     regression but the documented consequence of accepting the
+     limited-BIOS-ROM tradeoff.

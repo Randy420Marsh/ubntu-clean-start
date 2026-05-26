@@ -495,8 +495,13 @@ cat /sys/devices/system/cpu/microcode/version 2>/dev/null
 cat /proc/cmdline
 
 # 4. Microcode firmware files still on disk?
-ls -la /lib/firmware/intel-ucode/ 2>/dev/null
-ls -la /lib/firmware/amd-ucode/   2>/dev/null
+# Ubuntu 24.04 uses usrmerge, so /lib/firmware is a symlink to
+# /usr/lib/firmware. Both invocations look at the same directory; either
+# path may show up in plocate output.
+ls -la /usr/lib/firmware/intel-ucode/ 2>/dev/null
+ls -la /usr/lib/firmware/amd-ucode/   2>/dev/null
+ls -la /lib/firmware/intel-ucode/     2>/dev/null
+ls -la /lib/firmware/amd-ucode/       2>/dev/null
 sudo find / -xdev -type f \( -name '*ucode*' -o -name '*microcode*' \) \
     2>/dev/null | grep -v -E '/(proc|sys|run)/'
 
@@ -517,9 +522,14 @@ systemctl list-unit-files | grep -iE 'microcode|ucode'</pre>
 
     <p>How to clean up each remaining loader:</p>
     <ul>
-        <li>Check #4 lists files in <code>/lib/firmware/intel-ucode/</code>:
-            <code>sudo rm -rf /lib/firmware/intel-ucode</code> is safe
-            after the package is purged.</li>
+        <li>Check #4 lists files in
+            <code>/usr/lib/firmware/intel-ucode/</code> (or the
+            usrmerge symlink <code>/lib/firmware/intel-ucode/</code>):
+            <code>sudo rm -rf /usr/lib/firmware/intel-ucode</code> is
+            safe after the package is purged. With
+            <code>dis_ucode_ldr</code> set the kernel will not load
+            files from this directory anyway, so this is a tidiness
+            cleanup, not a functional one.</li>
         <li>Check #5 returns <code>/boot/intel-ucode.img</code>:
 <pre>sudo rm -f /boot/intel-ucode.img
 sudo update-grub</pre></li>
@@ -544,6 +554,42 @@ sudo update-grub</pre></li>
     by matching it against the BIOS Setup "CPU Microcode Revision"
     value. From the BIOS-vendor perspective this is exactly the
     pre-Plundervolt configuration the Z170 PG was tested against.</p>
+
+    <h3>Expected-but-alarming-looking dmesg lines</h3>
+    <p>Two messages that show up after disabling the loader are
+    expected and not bugs:</p>
+    <ul>
+        <li><code>Unknown kernel command line parameters
+            "text dis_ucode_ldr 3", will be passed to user space</code>.
+            This is the kernel's <em>core</em> parameter parser
+            complaining that it does not own those three tokens.
+            <code>dis_ucode_ldr</code> is registered as an
+            <code>early_param</code>, parsed before the core parser
+            runs; <code>text</code> and <code>3</code> are
+            <code>systemd</code> shorthand for "console-only,
+            multi-user.target". All three are handled correctly by the
+            right consumer; the "unknown" message is the core parser
+            saying "I do not know these, here you go userspace,"
+            which is fine. Confirm the <code>dis_ucode_ldr</code> half
+            actually fired by looking for a later
+            <code>dis_ucode_ldr</code> line in dmesg
+            (it shows up around <code>[ 0.6xx ]</code>).</li>
+        <li><code>MDS: Vulnerable: Clear CPU buffers attempted, no
+            microcode</code>, and equivalent lines for TAA, MMIO
+            Stale Data, SRBDS, GDS. These say "the CPU is still
+            architecturally vulnerable to these because the
+            microcode-based mitigation is not loaded — falling back to
+            buffer-clearing if we can." That is the
+            <em>expected</em> consequence of running without an OS-side
+            microcode update on a 6th-gen Skylake. Not a regression;
+            you accepted this tradeoff by choosing the "limited BIOS
+            ROM, can't fit current microcode" path. If you ever want
+            the microcode-based mitigations back, you have to either
+            re-enable the OS-side loader (Option A, undo) or update
+            the BIOS to a revision that includes a newer microcode
+            (only an option if a newer BIOS exists for your board and
+            it still fits the ROM).</li>
+    </ul>
 </div>
 
 <h2 id="driver">9. Reinstall the NVIDIA driver (.run + MOK + Secure Boot)</h2>
