@@ -33,6 +33,10 @@
 #
 set -uo pipefail
 
+#To cause more confusion during install...
+#Nvidia installer calls the MOK.key to "key",
+#and the MOK.der certificate to "public key"
+
 MOK_DIR=/root/module-signing
 MOK_KEY="$MOK_DIR/MOK.key"
 MOK_CRT="$MOK_DIR/MOK.der"
