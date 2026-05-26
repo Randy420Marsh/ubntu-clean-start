@@ -570,9 +570,18 @@ sudo dmesg | grep -iE 'efivars|efi: |variable storage|nvram' | head
 sudo apt install -y efivar
 sudo efivar -l | wc -l
 sudo efivar -l | head -40</pre>
-    <p>The four things that most commonly explain a "full" NVRAM on a
-    long-lived Linux install are:</p>
+    <p>The five things that most commonly explain a "full" NVRAM on a
+    long-lived Linux install are, roughly in order of how often they are
+    actually the culprit:</p>
     <ol>
+        <li><strong>An oversized <code>dbx</code> (Secure Boot
+            revocation list)</strong> that has been grown by
+            <code>fwupd</code> applying the periodic LVFS dbx update.
+            The factory <code>dbxDefault</code> is typically ~3–4 KB; the
+            current Microsoft-published revocation list (BlackLotus,
+            CVE-2023-24932, etc.) is ~17–30 KB. On Skylake-era ASRock
+            boards (Z170 PG, H170, B150) this single variable can
+            consume a quarter to a third of the whole NVRAM region;</li>
         <li>dozens of <code>dump-type0-*</code> entries from kernel
             panics (these can each be several KB);</li>
         <li>dozens of stale <code>Boot####</code> entries from old
@@ -583,6 +592,71 @@ sudo efivar -l | head -40</pre>
             failed previous import;</li>
         <li>the actual <code>MokListRT</code> if you have legitimately
             enrolled many keys over time.</li>
+    </ol>
+
+    <h3>Step 1.5 — handling an oversized <code>dbx</code> (the most
+        common Z170 PG cause)</h3>
+    <p>If your <code>ls -laS</code> shows <code>dbx-*</code> as the
+    single largest variable (typically 17–30 KB), the UEFI revocation
+    list itself is what is filling NVRAM. This is not a Linux bug — the
+    list grows every time <code>fwupd-refresh.timer</code> applies a
+    new revocation set from LVFS. Microsoft has expanded it
+    significantly since 2022 to revoke BlackLotus-affected bootloaders.
+    Reference: on a Z170 PG you should see something like:</p>
+<pre>-rw-------  17840  ...  dbx-d719b2cb-3d3a-4596-a3bc-dad00e67656f
+-rw-r--r--   3728  ...  dbxDefault-8be4df61-93ca-11d2-aa0d-00e098032b8c</pre>
+    <p>The 17 840 B runtime <code>dbx</code> on a board with ~64 KB of
+    NVRAM is already eating ~28 % of the region by itself. Combined
+    with ASRock-internal <code>StdDefaults</code> /
+    <code>VARSTORE_OCMR_SETTINGS_NAME</code> (~14 KB + ~9 KB on Z170 PG)
+    and the Secure Boot db / KEK / PK variables (~17 KB), there is no
+    room left for MokManager to allocate <code>MokNew</code>.</p>
+
+    <p>Fix, in order:</p>
+    <ol>
+        <li>
+            <p>Stop <code>fwupd</code> from growing <code>dbx</code>
+            further (do this <em>before</em> any reset, so it cannot
+            re-apply the update at the next boot):</p>
+<pre>sudo systemctl disable --now fwupd-refresh.timer
+sudo systemctl mask fwupd-refresh.service
+# Optional, if you do not use fwupd at all for firmware updates:
+sudo apt purge fwupd fwupd-signed</pre>
+        </li>
+        <li>
+            <p>Reset the runtime <code>dbx</code> to the factory
+            default from BIOS Setup. On ASRock 100/200-series:</p>
+            <ul>
+                <li>Boot to BIOS Setup → <strong>Security</strong> →
+                    <strong>Secure Boot</strong> →
+                    <strong>Key Management</strong>.</li>
+                <li>Select <strong>Forbidden Signatures Database
+                    (DBX)</strong> → <strong>Delete</strong> (or
+                    <strong>Reset to Setup Mode</strong> followed by
+                    <strong>Restore Factory Keys</strong>).</li>
+                <li>Save and exit.</li>
+                <li>Verify on the booted system:
+<pre>sudo ls -laS /sys/firmware/efi/efivars/dbx-*</pre>
+                    should now be ~3.7 KB, matching
+                    <code>dbxDefault</code>.</li>
+            </ul>
+        </li>
+        <li>
+            <p>Security tradeoff: by reverting <code>dbx</code> you
+            lose the protection against bootloaders that Microsoft has
+            revoked since the BIOS was manufactured (most importantly
+            BlackLotus and the CVE-2023-24932 cluster). This is an
+            acceptable tradeoff if you:</p>
+            <ul>
+                <li>do not dual-boot a current Windows install that
+                    relies on the dbx update for Defender;</li>
+                <li>are using your own MOK to sign your own modules
+                    (the whole reason this section exists);</li>
+                <li>and you understand that a malicious bootloader
+                    that was on the dbx will once again be allowed to
+                    run if it ever ends up on your ESP.</li>
+            </ul>
+        </li>
     </ol>
 
     <h3>Step 2 — clear Linux pstore crash dumps</h3>

@@ -791,3 +791,54 @@ in EFI variables, so purging it cannot free a single byte of NVRAM.
 Section 8 (microcode) and section 10 (MOK / NVRAM) are independent
 issues that just happen to both show up on the same Z170 PG board
 because of its small BIOS flash and small NVRAM region.
+
+### G8. Z170 PG empirical breakdown — Step 1.5 added after diagnosis
+
+After the initial section 10 was written, the user ran the diagnostic
+commands. The output on their Z170 PG showed:
+
+  - `dbx-*` (runtime UEFI revocation list): **17 840 B**
+  - `StdDefaults-*` (ASRock-internal): 14 225 B
+  - `VARSTORE_OCMR_SETTINGS_NAME-*` (ASRock OC manager): 8 941 B
+  - `db-*`: 6 326 B / `dbDefault-*`: 6 326 B
+  - `Setup-*`: 4 132 B
+  - `dbxDefault-*`: 3 728 B
+  - `KEK-*`: 3 577 B / `KEKDefault-*`: 3 577 B
+  - `MokListRT-*`: 2 948 B (only 3 enrolled MOKs)
+  - `/sys/fs/pstore/` empty (no kernel crash dumps)
+  - `mokutil --list-new` / `--list-delete` both empty (no wedged
+    pending request)
+  - `efibootmgr` boot entries: small set (Boot0003/7/8/9 only)
+
+Top 9 variables alone sum to ~71 KB on a board whose NVRAM region is
+~64 KB. The diagnosed root cause is therefore not MOK churn or pstore
+or stale Boot entries — it is that **`fwupd` has grown the runtime
+`dbx` from the factory ~3.7 KB to ~17.8 KB** by applying the periodic
+LVFS revocation update (BlackLotus / CVE-2023-24932 cluster). On
+Skylake-era ASRock boards (Z170 PG, H170, B150) the NVRAM region was
+sized in 2015 and never anticipated a ~17 KB revocation list, so
+`MokManager` cannot allocate `MokNew`.
+
+A new sub-section **Step 1.5 — handling an oversized `dbx`** was added
+between Step 1 (diagnose) and Step 2 (pstore) covering:
+
+  - `systemctl disable --now fwupd-refresh.timer` and
+    `systemctl mask fwupd-refresh.service` to stop the LVFS dbx update
+    from re-applying on next boot (must be done *before* any BIOS
+    reset, otherwise the next refresh will just re-grow `dbx`);
+  - BIOS Setup → Security → Secure Boot → Key Management →
+    Forbidden Signatures Database (DBX) → Delete, on ASRock
+    100/200-series boards, to revert the runtime `dbx` to
+    `dbxDefault`;
+  - verification with
+    `sudo ls -laS /sys/firmware/efi/efivars/dbx-*` showing the runtime
+    `dbx` is now ~3.7 KB;
+  - an explicit security-tradeoff callout that this re-allows
+    bootloaders that have been added to the Microsoft revocation list
+    since the board's BIOS was manufactured — acceptable for a
+    Linux-only / custom-MOK box but not for one that dual-boots a
+    current Windows install.
+
+The original numbered root-cause list at the top of section 10 was
+extended from four causes to five, with the oversized `dbx` listed
+first as the most common Skylake-era ASRock culprit.
