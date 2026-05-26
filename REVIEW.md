@@ -919,3 +919,172 @@ documentation gaps surfaced from the output and were patched:
      running without an OS-side microcode update. They are not a
      regression but the documented consequence of accepting the
      limited-BIOS-ROM tradeoff.
+
+---
+
+## Part H — dbx regrowth + BIOS-race enrolment workflow
+
+User-reported follow-up to Part G. After clearing `dbx` in BIOS and
+masking `fwupd-refresh.timer`, the user discovered that **`dbx`
+regrows back to ~17 KB on every reboot anyway**, blocking
+`mokutil --import` again. They worked out an empirical "BIOS-race"
+sequence that gets a single MOK enrolled by tapping the BIOS hotkey
+*before* shim launches MokManager, clearing `dbx` from BIOS Setup,
+saving, and only then letting the MokManager screen appear.
+
+Two new sub-sections of recovery_manual §10:
+
+### H1. Step 7 — find what is regrowing `dbx` at every boot
+
+Three candidates documented in priority order:
+
+1. **`secureboot-db` package.** Ships
+   `/usr/share/secureboot-db/dbx.esl`; its `secureboot-db.service`
+   oneshot runs at boot and writes the blob to firmware via
+   `update-secureboot-policy`. Disabled by `systemctl disable --now
+   secureboot-db.service && systemctl mask secureboot-db.service`.
+   Most likely culprit on stock Ubuntu 24.04 desktop installs.
+2. **`fwupd` daemon (not just the refresh timer).** Even with
+   `fwupd-refresh.timer` masked, `fwupd.service` can apply a
+   previously-downloaded dbx update on start. Mask the daemon too,
+   or `apt purge fwupd fwupd-signed` if not needed.
+3. **Shim auto-enroll path.** `MOK_AUTO_ENROLL=1` baked into some
+   third-party shim builds. Detect with
+   `strings /usr/lib/shim/shimx64.efi.signed | grep MOK_AUTO`. Rare
+   on Ubuntu stock shim.
+
+Plus diagnostic commands:
+- `ls -l /sys/firmware/efi/efivars/dbx-*` immediately after a fresh
+  boot (size delta tells you whether boot itself grew it);
+- `journalctl -b -0 | grep -iE 'dbx|secureboot|mok|efivar'` to see
+  which service touched NVRAM;
+- `find /usr/share /usr/lib /var/lib -name 'dbx*.esl' -o -name
+  'dbx*.bin'` to find any blob shipped by a package.
+
+### H2. Step 8 — BIOS-race workflow
+
+Nine-step empirical procedure that the user confirmed works on the
+ASRock Z170 PG. The key insight is that the BIOS dbx-clear has to
+happen *between* `mokutil`-side scheduling (which writes `MokNew`)
+and shim's MokManager launch — i.e. before the next cold boot
+reaches shim. The hotkey-spam-during-POST timing is what makes it
+work on a board where shim auto-launches MokManager too quickly.
+
+Sequence:
+
+1. `sudo mokutil --reset` (sets one-time password, schedules reset)
+2. Reboot, spam BIOS hotkey before shim launches
+3. BIOS → Security → Secure Boot → Key Management → DBX → Delete
+4. Reboot to GRUB → append `3` to cmdline → multi-user.target
+5. `sudo ./driver-install.sh --setup-mok` (queues `MokNew`)
+6. Reboot, spam BIOS hotkey again, clear DBX again
+7. MokManager finally has room: Enroll MOK → password
+8. Boot to verify with `mokutil --list-enrolled` and
+   `mokutil --test-key`
+9. Run `sudo ./driver-install.sh` for the actual driver install -
+   the script's `ensure_mok_enrolled()` calls `mokutil --test-key`
+   first and skips the import entirely when the MOK is already
+   enrolled, so the install itself cannot hit "MOK storage full"
+   again
+
+Explicit warning block at the end: the BIOS-race workflow is a
+coping mechanism for the *symptom*, not a fix for the *cause*. Every
+cold boot still regrows `dbx` until Step 7 is completed. Use it to
+get back to a working GUI so Step 7 can be diagnosed comfortably,
+not as a permanent operating mode.
+
+### H3. driver-install.sh `ensure_mok_enrolled()` — no change needed
+
+The script was already correct on this front:
+
+```
+if mokutil --test-key "$MOK_CRT" 2>&1 | grep -qi 'is already enrolled'; then
+  log "MOK is already enrolled in shim — good."
+  return 0
+fi
+```
+
+So a second run after the BIOS-race workflow short-circuits before
+`mokutil --import` and does not push any new variable into NVRAM.
+This is the property that makes the "enrol first, install driver
+second" ordering safe even on a regrowing-dbx board.
+
+---
+
+## Part I — pre-flight DKMS cleanup in driver-install.sh
+
+User-reported failure on re-running the installer after the BIOS-race
+MOK enrolment workflow (Part H) succeeded. The `.run` installer's
+DKMS step aborted with a wall of:
+
+```
+ERROR: Failed to run `/usr/sbin/dkms install --no-depmod -m nvidia -v 595.71.05 -k 6.8.0-117-lowlatency`:
+       Module .../nvidia.ko.zst already installed at version 595.71.05, override by specifying --force
+       Module .../nvidia-uvm.ko.zst already installed at version 595.71.05, override by specifying --force
+       Module .../nvidia-modeset.ko.zst already installed at version 595.71.05, override by specifying --force
+       Module .../nvidia-drm.ko.zst already installed at version 595.71.05, override by specifying --force
+       Module .../nvidia-peermem.ko.zst already installed at version 595.71.05, override by specifying --force
+       Error! Installation aborted.
+```
+
+Root cause: a prior installer run had already built and DKMS-installed
+the modules at version 595.71.05 under
+`/lib/modules/$(uname -r)/updates/dkms/`. The upstream `.run` installer
+does not expose `--force` for its embedded DKMS step, so the second
+run cannot overwrite. This is the expected DKMS collision-prevention
+behaviour, but on a re-install workflow (e.g. after failing to load
+under Secure Boot the first time) it blocks progress.
+
+### I1. driver-install.sh `clean_existing_dkms()`
+
+New pre-flight function inserted between the GPU-generation check and
+the display-server prep. It runs in four phases, all interactive
+(asks before deleting anything):
+
+1. **apt-managed NVIDIA dkms / source packages.** Detect
+   `nvidia-dkms-*`, `nvidia-kernel-source-*`, `libnvidia-cfg1`,
+   `libnvidia-extra-*` via `dpkg-query`. Even if these are not
+   currently building, they will re-build at the next `apt upgrade`
+   or kernel update and reintroduce the conflict. Offered to purge.
+2. **DKMS-tracked nvidia/* builds.** Parse `dkms status`, extract
+   each `module/version` pair (format varies across
+   Debian/Ubuntu/Pop!_OS versions, so we use a tolerant sed), and
+   run `dkms remove --all` on each.
+3. **Stale `.ko` / `.ko.zst` left behind in `/lib/modules` and
+   `/usr/lib/modules`.** Historically `dkms remove` does not always
+   delete these (Ubuntu 22.04 -> 24.04 dkms 2.x -> 3.x had a known
+   regression in this area), so we sweep with `find ... -delete`.
+4. **Refresh module dependency tree + initramfs** only if anything
+   was actually removed. Runs `depmod -a` for every kernel directory
+   and then `update-initramfs -u` so the kernel does not try to
+   autoload a module file that no longer exists.
+
+Phases 1 and 3 ask `ask_yn` before destructive action. Phases 2 and 4
+are idempotent and run unconditionally.
+
+The change is bundled into the same PR as the dbx-regrowth /
+BIOS-race documentation because the user hit this immediately after
+walking the BIOS-race workflow - both belong to the same end-to-end
+"get a working NVIDIA driver on a Z170 PG under Secure Boot" flow.
+
+### I2. recovery_manual section 9 - manual recipe documented
+
+A new sub-section under section 9 (driver install) documents the
+exact error output and gives the manual recipe (`dkms remove` ->
+`find ... -delete` -> `apt purge` -> `depmod -a` ->
+`update-initramfs -u` -> rerun). Includes a note block explaining
+*why* the conflict happens - DKMS sees its own prior install at the
+same version and refuses to overwrite - so the user understands that
+this is only a problem when reinstalling the same major version,
+not a permanent burden.
+
+### I3. Why this had to be in our wrapper, not "use --force"
+
+The `.run` installer accepts `--silent`, `--no-questions`,
+`--accept-license`, `--skip-module-load`, etc., but it does **not**
+forward `--force` to the embedded `dkms install` command. Passing
+`-- --force` or similar at the end of the .run argv does not work
+either; the DKMS sub-invocation is constructed inside
+`nvidia-installer` with a fixed argv. The only way to make the
+second run succeed is to remove the prior DKMS build before launching
+the installer. Hence the wrapper-level cleanup.

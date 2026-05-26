@@ -639,6 +639,69 @@ sudo ./driver-install.sh</pre>
 <pre>sudo mokutil --sb-state          # "SecureBoot enabled"?
 sudo mokutil --list-enrolled | grep -i 'Local NVIDIA'</pre>
     </div>
+
+    <h3>Symptom: <code>dkms install</code> aborts with "already installed at
+        version X, override by specifying --force"</h3>
+    <p>If a prior run of the installer (or an apt-shipped
+    <code>nvidia-dkms-*</code> package) left modules in
+    <code>/lib/modules/$(uname -r)/updates/dkms/</code>, the next
+    <code>.run</code> install will fail with a wall of errors like:</p>
+<pre>ERROR: Failed to run `/usr/sbin/dkms install --no-depmod -m nvidia -v 595.71.05 -k 6.8.0-117-lowlatency`:
+       Module /lib/modules/6.8.0-117-lowlatency/updates/dkms/nvidia.ko.zst
+       already installed at version 595.71.05, override by specifying --force
+       Module .../nvidia-uvm.ko.zst already installed at version 595.71.05, override by specifying --force
+       Module .../nvidia-modeset.ko.zst already installed at version 595.71.05, override by specifying --force
+       Module .../nvidia-drm.ko.zst already installed at version 595.71.05, override by specifying --force
+       Module .../nvidia-peermem.ko.zst already installed at version 595.71.05, override by specifying --force
+       Error! Installation aborted.</pre>
+
+    <p>The upstream <code>.run</code> installer does not expose a knob
+    to pass <code>--force</code> through to DKMS, so the prior build
+    has to be removed first. <code>driver-install.sh</code> now does
+    this automatically before launching the installer (asks before
+    deleting anything). The manual recipe, in case you need to run it
+    standalone:</p>
+<pre># 1. Tell DKMS to remove the existing build (all kernels):
+sudo dkms status | grep -i '^nvidia'
+sudo dkms remove nvidia/&lt;version&gt; --all
+
+# 2. Sweep any .ko / .ko.zst left behind in /lib/modules and
+#    /usr/lib/modules - dkms remove does not always delete these:
+sudo find /lib/modules /usr/lib/modules -type f \
+    \( -name 'nvidia.ko*' \
+       -o -name 'nvidia-uvm.ko*' \
+       -o -name 'nvidia-modeset.ko*' \
+       -o -name 'nvidia-drm.ko*' \
+       -o -name 'nvidia-peermem.ko*' \) \
+    -delete
+
+# 3. If apt-shipped nvidia-dkms-* is installed alongside, purge it -
+#    it will re-build modules on every kernel update and reintroduce
+#    the conflict:
+dpkg -l | grep -E '^ii.*(nvidia-dkms-|nvidia-kernel-source-)'
+sudo apt purge 'nvidia-dkms-*' 'nvidia-kernel-source-*'
+
+# 4. Refresh module dependency tree + initramfs so the kernel does
+#    not try to autoload modules that no longer exist on disk:
+sudo depmod -a
+sudo update-initramfs -u
+
+# 5. Now rerun:
+sudo ./driver-install.sh /path/to/NVIDIA-Linux-x86_64-&lt;version&gt;.run</pre>
+
+    <div class="note">
+        Why the conflict happens in the first place: when you run the
+        <code>.run</code> installer once with <code>--dkms</code>, it
+        registers <code>nvidia/&lt;version&gt;</code> in the DKMS
+        database <em>and</em> builds + installs the modules under
+        <code>/lib/modules/$(uname -r)/updates/dkms/</code>. On a
+        second run with the <em>same</em> version, DKMS sees its own
+        prior install, treats it as a collision, and refuses. A
+        different version would not collide. The cleanup above is
+        therefore only required when reinstalling the same major
+        version, which is exactly the case after a failed Secure Boot
+        / MOK pass where the modules built but did not load.
+    </div>
 </div>
 
 <h2 id="mokfull">10. Troubleshooting: "MOK storage full" / EFI NVRAM exhausted</h2>
@@ -899,6 +962,167 @@ sudo mokutil --import /root/module-signing/MOK.der</pre>
         complete the MokManager flow exactly once. Resist the urge to
         re-enrol "just in case" — every duplicate enrolment consumes
         more of the limited NVRAM.
+    </div>
+
+    <h3>Step 7 — find what is re-growing <code>dbx</code> at every boot</h3>
+    <p>If you clear <code>dbx</code> in BIOS (step 6) and it is right
+    back to ~17 KB after a single reboot, something on the Linux side
+    is re-applying the LVFS revocation list at every boot. On Ubuntu
+    24.04 there are three candidates, in order of likelihood:</p>
+
+    <ol>
+        <li>
+            <p><strong><code>secureboot-db</code> package.</strong>
+            Ships <code>/usr/share/secureboot-db/dbx.esl</code>; its
+            <code>secureboot-db.service</code> oneshot runs at boot
+            and writes that blob to firmware via
+            <code>update-secureboot-policy</code>. Even with
+            <code>fwupd-refresh.timer</code> masked, this service will
+            re-grow <code>dbx</code> on every boot.</p>
+<pre># Check whether it is installed and active:
+dpkg -l | grep -E '^ii\s+secureboot-db'
+systemctl status secureboot-db.service --no-pager 2>/dev/null
+sudo journalctl -u secureboot-db --no-pager -n 20 2>/dev/null
+
+# Stop it from re-applying at boot:
+sudo systemctl disable --now secureboot-db.service
+sudo systemctl mask secureboot-db.service
+# Optional - remove the package entirely (no other consumer on a
+# Linux-only / custom-MOK box):
+sudo apt purge secureboot-db</pre>
+        </li>
+
+        <li>
+            <p><strong><code>fwupd</code> daemon itself, not just the
+            refresh timer.</strong> Masking
+            <code>fwupd-refresh.timer</code> stops the periodic
+            download of new firmware metadata, but
+            <code>fwupd.service</code> can still apply a previously-
+            downloaded dbx update on next start. If you do not use
+            <code>fwupd</code> for anything (i.e. you do not flash
+            BIOS / firmware from Linux), mask the daemon too:</p>
+<pre>systemctl is-active fwupd.service
+sudo systemctl disable --now fwupd.service fwupd-refresh.service \
+                              fwupd-refresh.timer
+sudo systemctl mask    fwupd.service fwupd-refresh.service \
+                       fwupd-refresh.timer
+# Or, more permanently:
+sudo apt purge fwupd fwupd-signed</pre>
+        </li>
+
+        <li>
+            <p><strong>Shim's auto-enroll path.</strong> Some
+            Ubuntu/Debian builds of <code>shim-signed</code> have
+            <code>MOK_AUTO_ENROLL=1</code> baked in, which re-imports
+            any vendor MOK that shim's payload carries. This is rare
+            on Ubuntu's stock shim but does happen on third-party
+            builds. Check with:</p>
+<pre>strings /usr/lib/shim/shimx64.efi.signed 2>/dev/null \
+    | grep -iE 'auto.enroll|MOK_AUTO'
+# If you see "MOK_AUTO_ENROLL=1" or similar, the only fix is to
+# reinstall Ubuntu's stock shim-signed package, or to pin an older
+# revision that does not have the flag set.</pre>
+        </li>
+    </ol>
+
+    <p>To diagnose which of the three it is, watch what runs at boot
+    and touches NVRAM:</p>
+<pre># Right after a fresh boot from a known-clean dbx state:
+sudo ls -l /sys/firmware/efi/efivars/dbx-*
+# (note the size)
+
+sudo journalctl -b -0 --no-pager \
+    | grep -iE 'dbx|secureboot|mok|efivar|update-secureboot' \
+    | head -50
+
+# And find anything else on the system that ships a dbx update blob:
+sudo find /usr/share /usr/lib /var/lib -maxdepth 4 \
+    \( -name 'dbx*.esl' -o -name 'dbx*.bin' -o -name 'dbx.update*' \) \
+    2>/dev/null</pre>
+
+    <h3>Step 8 — BIOS-race workflow (when <code>dbx</code> keeps regrowing)</h3>
+    <p>On a board where the regrowth source (step 7) cannot or has not
+    yet been disabled, you can still enrol a single MOK by racing the
+    BIOS key press against the shim auto-enroll. This workflow is
+    confirmed to work on the ASRock Z170 PG:</p>
+
+    <ol>
+        <li>
+            <p>From the booted system, schedule a full MOK reset:</p>
+<pre>sudo mokutil --reset
+# Enter a one-time password when prompted. You will type the same
+# password into the MokManager blue screen later.</pre>
+        </li>
+        <li>
+            <p>Reboot. <strong>Start tapping the BIOS hotkey</strong>
+            (<kbd>F2</kbd> or <kbd>Delete</kbd> on the Z170 PG)
+            <em>immediately</em>, before the firmware passes control
+            to shim. You want to land in BIOS Setup
+            <em>before</em> the MokManager blue screen appears.</p>
+        </li>
+        <li>
+            <p>In BIOS Setup: <strong>Security → Secure Boot → Key
+            Management → Forbidden Signatures Database (DBX) →
+            Delete</strong> (or "Restore Default"). Save and exit.</p>
+        </li>
+        <li>
+            <p>The system will reboot. Now boot to a console-only
+            target by holding <kbd>Shift</kbd> at the GRUB menu (or
+            pressing <kbd>e</kbd>), append <code>3</code> to the
+            kernel command line, and press <kbd>Ctrl-X</kbd> to boot.
+            (See section 7.)</p>
+        </li>
+        <li>
+            <p>From the console, run the driver-install setup-mok
+            phase so the script generates and queues your MOK
+            enrolment:</p>
+<pre>sudo ./driver-install.sh --setup-mok</pre>
+            <p>The script writes <code>MOK.key</code> +
+            <code>MOK.der</code> under
+            <code>/root/module-signing/</code> and runs
+            <code>mokutil --import</code>, which schedules
+            MokManager to enrol the cert at next boot.</p>
+        </li>
+        <li>
+            <p>Reboot. Tap the BIOS hotkey <em>again</em> to land in
+            BIOS Setup before MokManager. Clear DBX again exactly as
+            in step 3. Save and exit.</p>
+        </li>
+        <li>
+            <p>This time the firmware has enough NVRAM headroom to
+            allocate <code>MokNew</code>, so the blue MokManager
+            screen appears. Choose <strong>Enroll MOK → Continue →
+            Yes</strong>, enter the password you set in step 1, and
+            confirm reboot.</p>
+        </li>
+        <li>
+            <p>The system now boots normally with your MOK enrolled.
+            Verify on the booted system:</p>
+<pre>sudo mokutil --list-enrolled | grep -i 'Subject:'
+sudo mokutil --test-key /root/module-signing/MOK.der</pre>
+        </li>
+        <li>
+            <p>Now <em>and only now</em> run the rest of the driver
+            install:</p>
+<pre>sudo ./driver-install.sh /path/to/NVIDIA-Linux-x86_64-*.run</pre>
+            <p>The script's <code>ensure_mok_enrolled()</code> step
+            calls <code>mokutil --test-key</code> first and skips the
+            <code>--import</code> entirely when the MOK is already
+            enrolled. So the install itself does <strong>not</strong>
+            push anything new into NVRAM and cannot hit
+            "MOK storage full" again, regardless of what step 7
+            uncovers.</p>
+        </li>
+    </ol>
+
+    <div class="warning">
+        The BIOS-race workflow is a coping mechanism for the symptom,
+        not a fix for the cause. As long as step 7 has not been
+        completed, every cold boot will refill <code>dbx</code> back
+        to ~17 KB and the next MOK churn will hit the same wall.
+        Treat this workflow as the way to <em>get</em> to a working
+        desktop where you can <em>diagnose</em> step 7 from a GUI,
+        not as a permanent operating mode.
     </div>
 
     <div class="warning">

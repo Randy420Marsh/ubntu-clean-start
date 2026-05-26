@@ -244,6 +244,109 @@ if [ -z "$MODULE_TYPE" ]; then
 fi
 log "Kernel module type: $MODULE_TYPE"
 
+# ---------- pre-flight: clean stale DKMS modules + apt-shipped nvidia ----
+#
+# The .run installer's DKMS step refuses to overwrite modules at the same
+# version already installed in /lib/modules/$(uname -r)/updates/dkms/. It
+# prints a wall of "Module ... already installed at version X, override by
+# specifying --force" errors and aborts. The .run installer does not expose
+# a knob to pass --force through to dkms, so we have to remove the prior
+# DKMS build ourselves before launching the installer.
+#
+# This also catches the common case where apt-shipped nvidia-dkms-* is
+# installed alongside a .run-installed driver. Those two compete for the
+# same /lib/modules slots and cause the same conflict on next reinstall.
+
+clean_existing_dkms() {
+  local removed_any=0
+
+  # 1. Any apt-managed nvidia-dkms-* package will reinstall its modules at
+  #    next boot via dkms autoinstall. Remove it before the .run install,
+  #    otherwise the next kernel update will resurrect the conflict.
+  if command -v dpkg >/dev/null 2>&1; then
+    local apt_pkgs
+    apt_pkgs=$(dpkg-query -W -f='${Package}\n' 2>/dev/null \
+                 | grep -E '^(nvidia-dkms-|nvidia-kernel-source-|libnvidia-cfg1|libnvidia-extra-)' \
+                 || true)
+    if [ -n "$apt_pkgs" ]; then
+      warn "Found apt-managed NVIDIA packages that will conflict with the .run install:"
+      # shellcheck disable=SC2086
+      printf '  %s\n' $apt_pkgs >&2
+      if ask_yn "Purge them now? [y/N]:" n; then
+        # shellcheck disable=SC2086
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y $apt_pkgs \
+          || warn "apt purge returned non-zero; continuing anyway."
+        removed_any=1
+      else
+        warn "Continuing without purge. The .run installer will likely fail with"
+        warn "'already installed at version X' from these apt packages."
+      fi
+    fi
+  fi
+
+  # 2. Any DKMS-tracked nvidia/* build. Iterate over what dkms knows about
+  #    and remove each module/version pair.
+  if command -v dkms >/dev/null 2>&1; then
+    local dkms_lines
+    dkms_lines=$(dkms status 2>/dev/null | grep -iE '^nvidia[^[:space:]]*' || true)
+    if [ -n "$dkms_lines" ]; then
+      log "DKMS reports existing nvidia builds; removing them:"
+      printf '  %s\n' "$dkms_lines"
+      # dkms status format varies between Debian/Ubuntu versions. Be
+      # forgiving and just grab "module/version" out of each line.
+      while IFS= read -r line; do
+        local modver
+        modver=$(echo "$line" | sed -E 's|^([^,/[:space:]]+)[/, ]+([^,[:space:]]+).*|\1/\2|')
+        if [ -n "$modver" ] && [ "$modver" != "$line" ]; then
+          log "  dkms remove $modver --all"
+          dkms remove "$modver" --all 2>/dev/null \
+            || warn "  dkms remove $modver --all failed; continuing."
+          removed_any=1
+        fi
+      done <<<"$dkms_lines"
+    fi
+  fi
+
+  # 3. Stale .ko / .ko.zst left behind in /lib/modules and /usr/lib/modules.
+  #    `dkms remove` *should* delete these, but historically does not on
+  #    every Ubuntu version; we sweep to be safe.
+  local stale
+  stale=$(find /lib/modules /usr/lib/modules -type f \
+              \( -name 'nvidia.ko*' \
+                 -o -name 'nvidia-uvm.ko*' \
+                 -o -name 'nvidia-modeset.ko*' \
+                 -o -name 'nvidia-drm.ko*' \
+                 -o -name 'nvidia-peermem.ko*' \) 2>/dev/null || true)
+  if [ -n "$stale" ]; then
+    warn "Stale NVIDIA .ko files found under /lib/modules:"
+    echo "$stale" >&2
+    if ask_yn "Delete them now? [y/N]:" n; then
+      echo "$stale" | xargs -r rm -f
+      removed_any=1
+    else
+      warn "Continuing without deletion. The .run installer will probably refuse"
+      warn "to overwrite them and abort."
+    fi
+  fi
+
+  # 4. Refresh the module dependency tree for any kernel that had nvidia
+  #    modules removed. Cheap and harmless even if nothing changed.
+  if [ "$removed_any" -eq 1 ] && command -v depmod >/dev/null 2>&1; then
+    for kdir in /lib/modules/*/; do
+      [ -d "$kdir" ] || continue
+      depmod -a "$(basename "$kdir")" 2>/dev/null || true
+    done
+    # And rebuild initramfs so the kernel does not try to autoload a
+    # module file that no longer exists on disk.
+    if command -v update-initramfs >/dev/null 2>&1; then
+      log "Rebuilding initramfs after DKMS cleanup..."
+      update-initramfs -u 2>&1 | tail -5 || warn "update-initramfs failed; continuing."
+    fi
+  fi
+}
+
+clean_existing_dkms
+
 # ---------- prepare to install: stop the display server -------------------
 
 if [ "$SKIP_ISOLATE" -eq 0 ]; then
