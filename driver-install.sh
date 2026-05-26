@@ -180,8 +180,22 @@ ensure_mok_enrolled() {
   echo
 
   if ask_yn "Run 'mokutil --import' now? [y/N]:" n; then
-    mokutil --import "$MOK_CRT" \
-      || die "mokutil --import failed."
+    if ! mokutil --import "$MOK_CRT" 2>&1 | tee /tmp/mokutil.import.log; then
+      :  # tee absorbs the exit status; check the log instead
+    fi
+    if grep -qiE 'storage (is )?full|allocate variable|failed to allocate' \
+         /tmp/mokutil.import.log 2>/dev/null; then
+      err "mokutil --import failed with 'MOK storage full' (EFI NVRAM is exhausted)."
+      err "This is NOT a too-many-MOKs problem; the EFI variable region is full."
+      err "See section 10 of recovery_manual.html in this repo for the fix"
+      err "(clear pstore dumps, prune stale Boot#### entries, revoke pending"
+      err "MOK requests, mokutil --reset, BIOS-level NVRAM clear)."
+      exit 1
+    fi
+    if ! grep -qiE 'reboot|input password|new password' \
+            /tmp/mokutil.import.log 2>/dev/null; then
+      die "mokutil --import failed. See /tmp/mokutil.import.log for the full message."
+    fi
     warn "Enrolment scheduled. Reboot and complete the MOK enrolment in"
     warn "MokManager BEFORE rerunning this script to install the driver."
     exit 0

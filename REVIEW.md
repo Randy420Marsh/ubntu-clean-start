@@ -721,3 +721,201 @@ Each option has an "undo" recipe. The section also calls out the
 security tradeoff: disabling microcode loading removes Spectre / L1TF /
 MDS / Downfall / INCEPTION mitigations that depend on a recent
 microcode revision.
+
+---
+
+## Part G — "MOK storage full" troubleshooting
+
+User-reported issue. After removing `intel-microcode` and clearing MOK
+keys from BIOS, `mokutil --import` still hit "MOK storage full" at the
+blue MokManager screen on reboot. The two facts together are a strong
+hint that the real cause is EFI variable region exhaustion, not the
+MOK list itself.
+
+Section 10 of the recovery manual now covers this end to end:
+
+### G1. Step 1 — diagnose what is actually consuming NVRAM
+
+`sudo ls -laS /sys/firmware/efi/efivars/ | head -30` plus the optional
+`efivar -l` give a size-sorted view. Four common culprits called out:
+
+1. `dump-type0-*` entries from kernel panics (pstore writing to
+   efivars). Often the dominant consumer.
+2. Stale `Boot####` entries from old kernels / live USBs / Windows
+   installs.
+3. Wedged pending MOK requests (`MokNew`, `MokDel`, `MokAuth`) left
+   after a failed import.
+4. Genuinely many `MokListRT` entries from repeated enrolments.
+
+### G2. Step 2 — clear pstore crash dumps
+
+`rm -f /sys/fs/pstore/*` removes the dumps and the matching efivar
+entries. To prevent regrowth, drop a `modprobe.d/pstore.conf` snippet
+disabling efi_pstore, or pass `efi_pstore.pstore_disable=1` on the
+kernel command line. Crash dumps still go through kdump / journald,
+just not into NVRAM.
+
+### G3. Step 3 — prune stale UEFI boot entries
+
+`efibootmgr -v` to enumerate, `efibootmgr -B -b <hex>` to delete.
+Section warns explicitly against deleting the entry that loaded the
+running kernel (cross-reference with `BootCurrent`).
+
+### G4. Step 4 — cancel wedged pending MOK requests
+
+`mokutil --revoke-import` and `mokutil --revoke-delete`, plus
+`--list-new` / `--list-delete` to verify they came out clean.
+
+### G5. Step 5 — `mokutil --reset` to wipe and re-enrol
+
+Last Linux-side resort. Schedules a full MOK list reset, the user
+completes it from the MokManager screen, then re-enrols a single
+custom MOK with `mokutil --import`.
+
+### G6. Step 6 — BIOS-level resets (ASRock Z170 PG specifically)
+
+Ordered from least to most invasive:
+
+1. BIOS → Security → Secure Boot → Key Management → Restore Factory
+   Keys.
+2. BIOS → Exit → Load UEFI Defaults (also resets XMP, fan curves).
+3. CMOS clear via CLRCMOS1 jumper or coin-cell pull (with the standard
+   30 s hold-down of the power button to drain capacitors).
+4. BIOS re-flash with "Clear NVRAM" if the ASRock BIOS exposes it.
+
+### G7. Note: microcode removal does not free MOK / NVRAM space
+
+The section explicitly flags this so future readers do not chase the
+same red herring the user did: `intel-microcode` lives in `/boot`, not
+in EFI variables, so purging it cannot free a single byte of NVRAM.
+Section 8 (microcode) and section 10 (MOK / NVRAM) are independent
+issues that just happen to both show up on the same Z170 PG board
+because of its small BIOS flash and small NVRAM region.
+
+### G8. Z170 PG empirical breakdown — Step 1.5 added after diagnosis
+
+After the initial section 10 was written, the user ran the diagnostic
+commands. The output on their Z170 PG showed:
+
+  - `dbx-*` (runtime UEFI revocation list): **17 840 B**
+  - `StdDefaults-*` (ASRock-internal): 14 225 B
+  - `VARSTORE_OCMR_SETTINGS_NAME-*` (ASRock OC manager): 8 941 B
+  - `db-*`: 6 326 B / `dbDefault-*`: 6 326 B
+  - `Setup-*`: 4 132 B
+  - `dbxDefault-*`: 3 728 B
+  - `KEK-*`: 3 577 B / `KEKDefault-*`: 3 577 B
+  - `MokListRT-*`: 2 948 B (only 3 enrolled MOKs)
+  - `/sys/fs/pstore/` empty (no kernel crash dumps)
+  - `mokutil --list-new` / `--list-delete` both empty (no wedged
+    pending request)
+  - `efibootmgr` boot entries: small set (Boot0003/7/8/9 only)
+
+Top 9 variables alone sum to ~71 KB on a board whose NVRAM region is
+~64 KB. The diagnosed root cause is therefore not MOK churn or pstore
+or stale Boot entries — it is that **`fwupd` has grown the runtime
+`dbx` from the factory ~3.7 KB to ~17.8 KB** by applying the periodic
+LVFS revocation update (BlackLotus / CVE-2023-24932 cluster). On
+Skylake-era ASRock boards (Z170 PG, H170, B150) the NVRAM region was
+sized in 2015 and never anticipated a ~17 KB revocation list, so
+`MokManager` cannot allocate `MokNew`.
+
+A new sub-section **Step 1.5 — handling an oversized `dbx`** was added
+between Step 1 (diagnose) and Step 2 (pstore) covering:
+
+  - `systemctl disable --now fwupd-refresh.timer` and
+    `systemctl mask fwupd-refresh.service` to stop the LVFS dbx update
+    from re-applying on next boot (must be done *before* any BIOS
+    reset, otherwise the next refresh will just re-grow `dbx`);
+  - BIOS Setup → Security → Secure Boot → Key Management →
+    Forbidden Signatures Database (DBX) → Delete, on ASRock
+    100/200-series boards, to revert the runtime `dbx` to
+    `dbxDefault`;
+  - verification with
+    `sudo ls -laS /sys/firmware/efi/efivars/dbx-*` showing the runtime
+    `dbx` is now ~3.7 KB;
+  - an explicit security-tradeoff callout that this re-allows
+    bootloaders that have been added to the Microsoft revocation list
+    since the board's BIOS was manufactured — acceptable for a
+    Linux-only / custom-MOK box but not for one that dual-boots a
+    current Windows install.
+
+The original numbered root-cause list at the top of section 10 was
+extended from four causes to five, with the oversized `dbx` listed
+first as the most common Skylake-era ASRock culprit.
+
+### G9. Section 8: "Verifying microcode is no longer loaded at boot"
+
+User follow-up: after purging `intel-microcode` and adding the
+`dis_ucode_ldr` kernel command line, how do you actually verify the
+OS-side microcode loader is gone? The Z170 PG has a ~20 KB NVRAM
+ceiling (per user-reported BIOS metric), so any wasted boot-time
+operation matters.
+
+New sub-section in section 8 walks through eight diagnostic checks
+covering every place microcode can still be applied at boot:
+
+1. `dmesg | grep -iE 'microcode|ucode'` — what the kernel did this
+   boot. "microcode updated early to revision 0x..." means the kernel
+   overrode the BIOS-baked microcode; "early microcode loader: lookup
+   failed" or no microcode-related output at all means the kernel
+   did not override.
+2. `/proc/cpuinfo` `microcode:` line + `/sys/devices/system/cpu/`
+   `microcode/version` — current revision running on the CPU.
+   Compare with the "CPU Microcode Revision" line in BIOS Setup.
+3. `/proc/cmdline` — confirms `dis_ucode_ldr` is actually applied.
+4. `/lib/firmware/intel-ucode/`, `/lib/firmware/amd-ucode/`, and a
+   filesystem-wide `find` for `*ucode*` / `*microcode*` files.
+5. `/boot/intel-ucode.img` and `/boot/amd-ucode.img` — the GRUB-style
+   early microcode image that GRUB chainloads before the kernel.
+6. `lsinitramfs /boot/initrd.img-$(uname -r) | grep -iE 'ucode|microcode'`
+   — initramfs may still bundle `kernel/x86/microcode/GenuineIntel.bin`
+   despite the package being purged.
+7. `/boot/grub/grub.cfg` and `/etc/grub.d/*microcode*` — GRUB config
+   may still chainload an image.
+8. `dpkg -l | grep -iE 'microcode|ucode|iucode'` and
+   `systemctl list-unit-files | grep -iE 'microcode|ucode'` —
+   remaining packages or services.
+
+Each check has a documented cleanup recipe. Includes an explicit
+explanation of the underlying physics: CPU microcode is volatile and
+must be reloaded every cold boot; the BIOS always applies its baked
+revision first; "disabling microcode" only means "do not let the OS
+override the BIOS revision", not "run with no microcode at all"
+(which is impossible). Eliminates the common misunderstanding where
+users expect `/proc/cpuinfo` to show revision 0 after `apt purge`.
+
+### G10. Section 8: usrmerge path + alarming-but-expected dmesg lines
+
+User ran the eight checks. Empirical Z170 PG output confirmed the
+loader is fully disabled (no "microcode updated early" line, kernel
+explicitly logs `dis_ucode_ldr` at ~[ 0.636 ], `/proc/cpuinfo`
+microcode is 0xc2 = BIOS-baked, `/boot/intel-ucode.img` absent). Two
+documentation gaps surfaced from the output and were patched:
+
+1. **usrmerge path.** Original Check #4 only listed
+   `/lib/firmware/intel-ucode/`. On Ubuntu 24.04 with usrmerge, the
+   canonical path is `/usr/lib/firmware/intel-ucode/` and
+   `plocate intel-ucode` will return that path, not the symlink. Both
+   paths are now listed (they resolve to the same directory after
+   usrmerge but it confuses readers when the documented path does not
+   match what `plocate` printed).
+
+2. **"Unknown kernel command line parameters" message** — an
+   inexperienced reader can easily mistake this for "the kernel
+   refused my microcode disable flag". A new sub-section *Expected-
+   but-alarming-looking dmesg lines* now explains:
+
+   - `dis_ucode_ldr` is registered as an `early_param`, parsed before
+     the core parser runs; the core parser's "unknown parameters"
+     message is just it disclaiming the tokens it does not own.
+     `text` and `3` are systemd shorthand for console-only +
+     multi-user.target, handled by systemd.
+   - The way to confirm the `dis_ucode_ldr` half actually fired is to
+     look for a later `dis_ucode_ldr` line in dmesg (typically around
+     `[ 0.6xx ]`) — which the user's screenshot showed at exactly
+     `[ 0.636141 ]`.
+   - The `MDS: Vulnerable: ... no microcode` / TAA / MMIO Stale Data
+     / SRBDS / GDS lines are *expected* on a Skylake-class CPU
+     running without an OS-side microcode update. They are not a
+     regression but the documented consequence of accepting the
+     limited-BIOS-ROM tradeoff.

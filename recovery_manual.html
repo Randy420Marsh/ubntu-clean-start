@@ -43,9 +43,10 @@ sections delete files. Don't run them blind.
         <li><a href="#tty">7. Boot to terminal-only mode (TTY / GRUB / target 3)</a></li>
         <li><a href="#microcode">8. Disable the kernel microcode loader (limited-BIOS-ROM boards, e.g. ASRock Z170 PG)</a></li>
         <li><a href="#driver">9. Reinstall the NVIDIA driver (.run + MOK + Secure Boot)</a></li>
-        <li><a href="#cuda">10. Reinstall CUDA / cuDNN (optional)</a></li>
-        <li><a href="#gui">11. Fix a broken nvidia-settings GUI (optional)</a></li>
-        <li><a href="#final">12. Final cleanup and sanity check</a></li>
+        <li><a href="#mokfull">10. Troubleshooting: "MOK storage full" / EFI NVRAM exhausted</a></li>
+        <li><a href="#cuda">11. Reinstall CUDA / cuDNN (optional)</a></li>
+        <li><a href="#gui">12. Fix a broken nvidia-settings GUI (optional)</a></li>
+        <li><a href="#final">13. Final cleanup and sanity check</a></li>
     </ol>
 </div>
 
@@ -460,6 +461,135 @@ dmesg | grep -iE 'microcode|ucode'</pre>
         affecting your specific stepping (<code>cat /proc/cpuinfo | grep
         -m1 -E 'model|stepping'</code>).
     </div>
+
+    <h3>Verifying microcode is no longer loaded at boot</h3>
+    <p>After purging <code>intel-microcode</code> (Option B) or adding
+    <code>dis_ucode_ldr</code> (Option A), microcode can still be
+    applied at boot from any of these six places. Run the checks
+    below; they confirm whether the kernel is still loading a blob.</p>
+
+    <p>Important context: the BIOS itself <em>always</em> applies the
+    microcode it was shipped with at power-on, regardless of OS — CPU
+    microcode is volatile and has to be reloaded every cold boot. The
+    OS-side loader's only job is to <em>override</em> the BIOS-baked
+    microcode with a newer revision after boot. "Disabling microcode"
+    therefore means "do not let the OS override the BIOS revision",
+    not "run the CPU with no microcode at all" (which is not a thing).</p>
+
+<pre># 1. What the running kernel actually did this boot. Look for
+#    "microcode updated early to revision 0x..." or "microcode patch
+#    loaded". If you see neither, the kernel did not override the
+#    BIOS-baked microcode. If you see "early microcode loader: lookup
+#    failed", that is also fine - it tried, found nothing, gave up.
+sudo dmesg | grep -iE 'microcode|ucode'
+
+# 2. Current revision running on the CPU. Compare with the "CPU
+#    Microcode Revision" / "Microcode Patch ID" line in BIOS Setup.
+grep -i microcode /proc/cpuinfo | head -1
+cat /sys/devices/system/cpu/microcode/version 2>/dev/null
+
+# 3. Kernel command line as actually applied. If you used Option A
+#    you must see "dis_ucode_ldr" here. If not, /etc/default/grub was
+#    not saved, or update-grub was not run, or you booted an old
+#    GRUB entry.
+cat /proc/cmdline
+
+# 4. Microcode firmware files still on disk?
+# Ubuntu 24.04 uses usrmerge, so /lib/firmware is a symlink to
+# /usr/lib/firmware. Both invocations look at the same directory; either
+# path may show up in plocate output.
+ls -la /usr/lib/firmware/intel-ucode/ 2>/dev/null
+ls -la /usr/lib/firmware/amd-ucode/   2>/dev/null
+ls -la /lib/firmware/intel-ucode/     2>/dev/null
+ls -la /lib/firmware/amd-ucode/       2>/dev/null
+sudo find / -xdev -type f \( -name '*ucode*' -o -name '*microcode*' \) \
+    2>/dev/null | grep -v -E '/(proc|sys|run)/'
+
+# 5. GRUB-style early microcode image in /boot?
+ls -la /boot/intel-ucode.img /boot/amd-ucode.img 2>/dev/null
+
+# 6. Initramfs for the running kernel still bundling microcode?
+sudo lsinitramfs /boot/initrd.img-$(uname -r) 2>/dev/null \
+    | grep -iE 'ucode|microcode'
+
+# 7. Does grub.cfg still chainload a microcode image?
+sudo grep -niE 'ucode|microcode' /boot/grub/grub.cfg \
+    /etc/grub.d/*microcode* 2>/dev/null
+
+# 8. Any microcode-related packages or services still installed?
+dpkg -l | grep -iE 'microcode|ucode|iucode'
+systemctl list-unit-files | grep -iE 'microcode|ucode'</pre>
+
+    <p>How to clean up each remaining loader:</p>
+    <ul>
+        <li>Check #4 lists files in
+            <code>/usr/lib/firmware/intel-ucode/</code> (or the
+            usrmerge symlink <code>/lib/firmware/intel-ucode/</code>):
+            <code>sudo rm -rf /usr/lib/firmware/intel-ucode</code> is
+            safe after the package is purged. With
+            <code>dis_ucode_ldr</code> set the kernel will not load
+            files from this directory anyway, so this is a tidiness
+            cleanup, not a functional one.</li>
+        <li>Check #5 returns <code>/boot/intel-ucode.img</code>:
+<pre>sudo rm -f /boot/intel-ucode.img
+sudo update-grub</pre></li>
+        <li>Check #6 lists
+            <code>kernel/x86/microcode/GenuineIntel.bin</code>:
+            initramfs is still bundling microcode. Force a rebuild:
+<pre>sudo update-initramfs -u -k all</pre></li>
+        <li>Check #7 returns matches in
+            <code>/boot/grub/grub.cfg</code>:
+            after the above two cleanups, regenerate the GRUB config:
+<pre>sudo update-grub</pre></li>
+        <li>Check #8 lists anything other than <code>iucode-tool</code>
+            (which is just the tool, not firmware):
+<pre>sudo apt purge intel-microcode amd64-microcode iucode-tool</pre></li>
+        <li>Check #3 is missing <code>dis_ucode_ldr</code>: redo
+            Option A — edit <code>/etc/default/grub</code>,
+            <code>sudo update-grub</code>, reboot.</li>
+    </ul>
+
+    <p>Once all eight checks come back clean, the CPU is running on
+    whatever microcode revision the BIOS shipped with — verified in #2
+    by matching it against the BIOS Setup "CPU Microcode Revision"
+    value. From the BIOS-vendor perspective this is exactly the
+    pre-Plundervolt configuration the Z170 PG was tested against.</p>
+
+    <h3>Expected-but-alarming-looking dmesg lines</h3>
+    <p>Two messages that show up after disabling the loader are
+    expected and not bugs:</p>
+    <ul>
+        <li><code>Unknown kernel command line parameters
+            "text dis_ucode_ldr 3", will be passed to user space</code>.
+            This is the kernel's <em>core</em> parameter parser
+            complaining that it does not own those three tokens.
+            <code>dis_ucode_ldr</code> is registered as an
+            <code>early_param</code>, parsed before the core parser
+            runs; <code>text</code> and <code>3</code> are
+            <code>systemd</code> shorthand for "console-only,
+            multi-user.target". All three are handled correctly by the
+            right consumer; the "unknown" message is the core parser
+            saying "I do not know these, here you go userspace,"
+            which is fine. Confirm the <code>dis_ucode_ldr</code> half
+            actually fired by looking for a later
+            <code>dis_ucode_ldr</code> line in dmesg
+            (it shows up around <code>[ 0.6xx ]</code>).</li>
+        <li><code>MDS: Vulnerable: Clear CPU buffers attempted, no
+            microcode</code>, and equivalent lines for TAA, MMIO
+            Stale Data, SRBDS, GDS. These say "the CPU is still
+            architecturally vulnerable to these because the
+            microcode-based mitigation is not loaded — falling back to
+            buffer-clearing if we can." That is the
+            <em>expected</em> consequence of running without an OS-side
+            microcode update on a 6th-gen Skylake. Not a regression;
+            you accepted this tradeoff by choosing the "limited BIOS
+            ROM, can't fit current microcode" path. If you ever want
+            the microcode-based mitigations back, you have to either
+            re-enable the OS-side loader (Option A, undo) or update
+            the BIOS to a revision that includes a newer microcode
+            (only an option if a newer BIOS exists for your board and
+            it still fits the ROM).</li>
+    </ul>
 </div>
 
 <h2 id="driver">9. Reinstall the NVIDIA driver (.run + MOK + Secure Boot)</h2>
@@ -511,7 +641,276 @@ sudo mokutil --list-enrolled | grep -i 'Local NVIDIA'</pre>
     </div>
 </div>
 
-<h2 id="cuda">10. Reinstall CUDA / cuDNN (optional)</h2>
+<h2 id="mokfull">10. Troubleshooting: "MOK storage full" / EFI NVRAM exhausted</h2>
+<div class="step">
+    <p>Symptom: at the blue MokManager screen after
+    <code>mokutil --import</code>, the firmware prints
+    <strong>"MOK storage full"</strong> (or "failed to allocate variable")
+    and refuses to enrol the key. After reboot the kernel modules signed
+    with that MOK still fail to load.</p>
+
+    <p>What this actually means: <em>not</em> that you have too many MOKs.
+    It means the EFI variable region in firmware NVRAM is exhausted.
+    Mainboards have a fixed-size NVRAM area (often only ~64 KB on
+    Skylake-era ASRock boards) that is shared by:</p>
+    <ul>
+        <li>Secure Boot key databases (<code>db</code>, <code>dbx</code>,
+            <code>KEK</code>, <code>PK</code>);</li>
+        <li>MOK variables (<code>MokListRT</code>,
+            <code>MokListXRT</code>, <code>MokListTrustedRT</code>,
+            and the pending-request siblings <code>MokNew</code>,
+            <code>MokDel</code>, <code>MokAuth</code>);</li>
+        <li>UEFI boot entries (<code>Boot####</code>,
+            <code>BootOrder</code>, <code>BootCurrent</code>);</li>
+        <li>Linux pstore crash dumps written through the
+            <code>efivars</code> backend
+            (<code>dump-type0-*-#-#-#</code>); these accumulate every
+            time the kernel panics or you call <code>echo c &gt;
+            /proc/sysrq-trigger</code>;</li>
+        <li>Firmware-side data (HII forms, certificate revocation lists,
+            CSM compatibility tables on hybrid BIOSes, OEM logos,
+            anti-rollback counters, fTPM state on boards with
+            firmware-TPM, ASRock-specific "Instant Flash" / "Easy Driver
+            Installer" state).</li>
+    </ul>
+
+    <p>Clearing <em>just</em> the MOK keys from the BIOS does not
+    reclaim the space taken by everything else. You have to find what
+    is actually consuming the region.</p>
+
+    <div class="warning">
+        <strong>Read this whole section before touching anything in
+        <code>/sys/firmware/efi/efivars/</code>.</strong> A wrong
+        <code>rm</code> in that directory can brick the board
+        (historically, <code>rm -rf</code> on <code>efivars</code>
+        nuked some Samsung laptops). Recent kernels make the dangerous
+        variables immutable with <code>chattr +i</code>, but treat the
+        directory as live firmware state, not a filesystem.
+    </div>
+
+    <h3>Step 1 — see what is actually consuming NVRAM</h3>
+<pre># Top consumers of EFI variable storage, largest first:
+sudo ls -laS /sys/firmware/efi/efivars/ | head -30
+
+# Total in-use vs total available (kernel reports both via dmesg):
+sudo dmesg | grep -iE 'efivars|efi: |variable storage|nvram' | head
+
+# A nicer breakdown if you have the 'efivar' tool:
+sudo apt install -y efivar
+sudo efivar -l | wc -l
+sudo efivar -l | head -40</pre>
+    <p>The five things that most commonly explain a "full" NVRAM on a
+    long-lived Linux install are, roughly in order of how often they are
+    actually the culprit:</p>
+    <ol>
+        <li><strong>An oversized <code>dbx</code> (Secure Boot
+            revocation list)</strong> that has been grown by
+            <code>fwupd</code> applying the periodic LVFS dbx update.
+            The factory <code>dbxDefault</code> is typically ~3–4 KB; the
+            current Microsoft-published revocation list (BlackLotus,
+            CVE-2023-24932, etc.) is ~17–30 KB. On Skylake-era ASRock
+            boards (Z170 PG, H170, B150) this single variable can
+            consume a quarter to a third of the whole NVRAM region;</li>
+        <li>dozens of <code>dump-type0-*</code> entries from kernel
+            panics (these can each be several KB);</li>
+        <li>dozens of stale <code>Boot####</code> entries from old
+            kernels / live USBs / Windows installs that were never
+            cleaned up;</li>
+        <li>a wedged pending MOK request (<code>MokNew</code>,
+            <code>MokDel</code>, <code>MokAuth</code>) left after a
+            failed previous import;</li>
+        <li>the actual <code>MokListRT</code> if you have legitimately
+            enrolled many keys over time.</li>
+    </ol>
+
+    <h3>Step 1.5 — handling an oversized <code>dbx</code> (the most
+        common Z170 PG cause)</h3>
+    <p>If your <code>ls -laS</code> shows <code>dbx-*</code> as the
+    single largest variable (typically 17–30 KB), the UEFI revocation
+    list itself is what is filling NVRAM. This is not a Linux bug — the
+    list grows every time <code>fwupd-refresh.timer</code> applies a
+    new revocation set from LVFS. Microsoft has expanded it
+    significantly since 2022 to revoke BlackLotus-affected bootloaders.
+    Reference: on a Z170 PG you should see something like:</p>
+<pre>-rw-------  17840  ...  dbx-d719b2cb-3d3a-4596-a3bc-dad00e67656f
+-rw-r--r--   3728  ...  dbxDefault-8be4df61-93ca-11d2-aa0d-00e098032b8c</pre>
+    <p>The 17 840 B runtime <code>dbx</code> on a board with ~64 KB of
+    NVRAM is already eating ~28 % of the region by itself. Combined
+    with ASRock-internal <code>StdDefaults</code> /
+    <code>VARSTORE_OCMR_SETTINGS_NAME</code> (~14 KB + ~9 KB on Z170 PG)
+    and the Secure Boot db / KEK / PK variables (~17 KB), there is no
+    room left for MokManager to allocate <code>MokNew</code>.</p>
+
+    <p>Fix, in order:</p>
+    <ol>
+        <li>
+            <p>Stop <code>fwupd</code> from growing <code>dbx</code>
+            further (do this <em>before</em> any reset, so it cannot
+            re-apply the update at the next boot):</p>
+<pre>sudo systemctl disable --now fwupd-refresh.timer
+sudo systemctl mask fwupd-refresh.service
+# Optional, if you do not use fwupd at all for firmware updates:
+sudo apt purge fwupd fwupd-signed</pre>
+        </li>
+        <li>
+            <p>Reset the runtime <code>dbx</code> to the factory
+            default from BIOS Setup. On ASRock 100/200-series:</p>
+            <ul>
+                <li>Boot to BIOS Setup → <strong>Security</strong> →
+                    <strong>Secure Boot</strong> →
+                    <strong>Key Management</strong>.</li>
+                <li>Select <strong>Forbidden Signatures Database
+                    (DBX)</strong> → <strong>Delete</strong> (or
+                    <strong>Reset to Setup Mode</strong> followed by
+                    <strong>Restore Factory Keys</strong>).</li>
+                <li>Save and exit.</li>
+                <li>Verify on the booted system:
+<pre>sudo ls -laS /sys/firmware/efi/efivars/dbx-*</pre>
+                    should now be ~3.7 KB, matching
+                    <code>dbxDefault</code>.</li>
+            </ul>
+        </li>
+        <li>
+            <p>Security tradeoff: by reverting <code>dbx</code> you
+            lose the protection against bootloaders that Microsoft has
+            revoked since the BIOS was manufactured (most importantly
+            BlackLotus and the CVE-2023-24932 cluster). This is an
+            acceptable tradeoff if you:</p>
+            <ul>
+                <li>do not dual-boot a current Windows install that
+                    relies on the dbx update for Defender;</li>
+                <li>are using your own MOK to sign your own modules
+                    (the whole reason this section exists);</li>
+                <li>and you understand that a malicious bootloader
+                    that was on the dbx will once again be allowed to
+                    run if it ever ends up on your ESP.</li>
+            </ul>
+        </li>
+    </ol>
+
+    <h3>Step 2 — clear Linux pstore crash dumps</h3>
+    <p>These are the most common culprit and the safest to remove.
+    <code>pstore</code> is the kernel's crash-dump backend; on UEFI
+    systems it routes through EFI variables by default. Each panic
+    leaves a 1–4 KB blob in NVRAM that nobody ever cleans up.</p>
+<pre># See what is there:
+sudo ls -lh /sys/fs/pstore/ 2>/dev/null
+
+# Delete them (this also removes the matching efivars entries):
+sudo rm -f /sys/fs/pstore/*
+
+# Stop them from coming back: log to disk instead of efivars.
+sudo tee /etc/modprobe.d/pstore.conf &gt;/dev/null &lt;&lt;'EOF'
+# Prefer a filesystem-backed pstore so crash dumps do not fill EFI NVRAM.
+options efi_pstore pstore_disable=1
+EOF
+sudo update-initramfs -u</pre>
+    <p>For a stronger fix on boards with chronically small NVRAM, add
+    <code>efi_pstore.pstore_disable=1</code> to
+    <code>GRUB_CMDLINE_LINUX_DEFAULT</code> in
+    <code>/etc/default/grub</code> and <code>sudo update-grub</code>.
+    Crashes still get logged via kdump / journald, just not into EFI
+    NVRAM.</p>
+
+    <h3>Step 3 — prune stale UEFI boot entries</h3>
+    <p>On a system that has gone through several reinstalls (Ubuntu
+    24.04, the prior 22.04, a Windows partition, a live USB, etc.),
+    <code>efibootmgr -v</code> will often show 10–20
+    <code>Boot####</code> entries pointing at filesystems that no longer
+    exist.</p>
+<pre># List current entries with their targets:
+sudo efibootmgr -v
+
+# Each entry is hex-numbered (Boot0000, Boot0001, ...).
+# Delete a specific one:
+sudo efibootmgr -B -b 0007        # delete entry Boot0007
+
+# Or, more conservatively, just deactivate it first:
+sudo efibootmgr -A -b 0007        # mark Boot0007 inactive</pre>
+    <p>Only delete entries you can clearly identify as stale (e.g.
+    "ubuntu (on /dev/disk/by-partuuid/&lt;gone&gt;)", "USB device
+    (vanished)"). <strong>Do not delete the live entry that loaded
+    your current kernel</strong> — cross-reference with
+    <code>cat /sys/firmware/efi/efivars/BootCurrent-*</code>.</p>
+
+    <h3>Step 4 — cancel a wedged pending MOK request</h3>
+    <p>If a previous <code>mokutil --import</code> or
+    <code>mokutil --delete</code> was started but never confirmed in
+    MokManager, the request sits in NVRAM consuming space and the next
+    import sees a "full" region.</p>
+<pre># See what is queued:
+sudo mokutil --list-new
+sudo mokutil --list-delete
+
+# Cancel any pending import:
+sudo mokutil --revoke-import
+
+# Cancel any pending delete:
+sudo mokutil --revoke-delete
+
+# Sanity check: should both print "MokNew is empty" / "MokDel is empty".
+sudo mokutil --list-new
+sudo mokutil --list-delete</pre>
+
+    <h3>Step 5 — last resort: wipe and reseed the entire MOK list</h3>
+    <p>If you have legitimately enrolled many MOKs and need to start
+    over with a single one (the typical case for a custom-built kernel
+    module signing setup):</p>
+<pre># Schedule a full MOK reset on next boot. Asks for a one-time password.
+sudo mokutil --reset
+
+# After reboot, in the blue MokManager screen:
+#   - choose "Reset MOK" -&gt; "Continue"
+#   - enter the password
+#   - reboot
+# All currently enrolled MOKs are removed. Re-enrol your one custom MOK with:
+sudo mokutil --import /root/module-signing/MOK.der</pre>
+
+    <h3>Step 6 — BIOS-level last resort (ASRock Z170 PG and friends)</h3>
+    <p>If steps 2–5 still leave NVRAM full, the firmware itself is
+    holding state that Linux cannot reach. Order of operations:</p>
+    <ol>
+        <li><strong>BIOS Setup → Security → Secure Boot → Key
+            Management → Restore Factory Keys</strong> (or "Reset to
+            Setup Mode" then "Install default keys"). This is the
+            "right" reset path on ASRock 100/200-series boards.</li>
+        <li><strong>BIOS Setup → Exit → Load UEFI Defaults</strong>
+            — the catch-all factory-reset on ASRock. Save and exit.
+            <em>This resets everything else too</em>, including XMP
+            memory profiles and fan curves — expect to redo those.</li>
+        <li><strong>Clear CMOS via jumper or coin-cell pull.</strong>
+            For the Z170 PG: power off, unplug, hold the front-panel
+            power button for ~30 s to drain capacitors, move the CLRCMOS1
+            jumper or pull the coin-cell battery for 5–10 minutes,
+            replace, power on. This wipes everything in NVRAM that
+            survives a normal defaults-restore (anti-rollback counters,
+            stuck Secure Boot vendor entries, fTPM state).</li>
+        <li><strong>BIOS update / re-flash.</strong> ASRock's Instant
+            Flash, applied with the "Clear NVRAM" option (if your BIOS
+            version exposes it), forces a full NVRAM re-init. Use the
+            <em>same</em> BIOS version you are already on; you only want
+            the NVRAM reset, not a firmware change.</li>
+    </ol>
+
+    <div class="note">
+        After any of step 6, Secure Boot is back in Setup Mode (no MOK
+        list, no <code>db</code> entries beyond the firmware defaults).
+        Re-enrol your custom MOK with <code>mokutil --import</code> and
+        complete the MokManager flow exactly once. Resist the urge to
+        re-enrol "just in case" — every duplicate enrolment consumes
+        more of the limited NVRAM.
+    </div>
+
+    <div class="warning">
+        Removing <code>intel-microcode</code> (section 8) does NOT free
+        any MOK / NVRAM space. Microcode lives in <code>/boot</code> on
+        the filesystem, not in EFI variables. If you tried that as a
+        workaround for "MOK storage full," it was a coincidence, not a
+        fix — the two issues are unrelated.
+    </div>
+</div>
+
+<h2 id="cuda">11. Reinstall CUDA / cuDNN (optional)</h2>
 <div class="step">
     <p>Only after the purge in step 6 has succeeded. Install the CUDA toolkit
     version you actually want from
@@ -563,7 +962,7 @@ sudo apt install -y cudnn</pre>
     </div>
 </div>
 
-<h2 id="gui">11. Fix a broken <code>nvidia-settings</code> GUI (optional)</h2>
+<h2 id="gui">12. Fix a broken <code>nvidia-settings</code> GUI (optional)</h2>
 <div class="step">
     <p>Some Ubuntu releases shipped an <code>nvidia-settings</code> package
     (the 510 / 590 series) that crashes with
@@ -592,7 +991,7 @@ sudo ./fix_nvidia_gui_v2.sh revert    # restore the apt-shipped files</pre>
     </div>
 </div>
 
-<h2 id="final">12. Final cleanup and sanity check</h2>
+<h2 id="final">13. Final cleanup and sanity check</h2>
 <div class="step">
 <pre>sudo apt update
 sudo apt full-upgrade -y
